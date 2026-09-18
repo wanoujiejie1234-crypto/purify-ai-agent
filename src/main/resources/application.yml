@@ -1,0 +1,181 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: purify-ai-agent
+
+  # ==================== 文件上传：图片解读走 multipart ====================
+  servlet:
+    multipart:
+      # 手机拍的照片动辄 3~8MB，用默认的 1MB 会直接被 MaxUploadSizeExceededException 拒掉
+      max-file-size: 10MB
+      max-request-size: 12MB
+
+  # ==================== 数据源：对话记忆持久化到本地 MySQL ====================
+  datasource:
+    # createDatabaseIfNotExist=true：库不存在时自动创建，换机器也能直接跑起来
+    url: jdbc:mysql://localhost:3306/purify_ai_agent?createDatabaseIfNotExist=true&useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
+    username: root
+    password: 12345
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+  ai:
+    # ---------------- 对话记忆：官方 JdbcChatMemoryRepository ----------------
+    chat:
+      memory:
+        repository:
+          jdbc:
+            # 默认值 embedded 只对内存库生效，MySQL 必须显式设为 always
+            initialize-schema: always
+            # 官方 jar 内没有 schema-mysql.sql，这里指向自带脚本，见 db/chat-memory-schema-mysql.sql
+            schema: classpath:db/chat-memory-schema-mysql.sql
+    # ---------------- 通义千问 DashScope ----------------
+    dashscope:
+      api-key: "sk-61cbfece8da24d2680c10b897fc7cbb6"
+      # 原生 SDK 的根地址；带 /compatible-mode/v1 的是 OpenAI 兼容模式，此处不适用
+      base-url: https://dashscope.aliyuncs.com
+      chat:
+        options:
+          model: qwen-plus
+          temperature: 0.7
+
+# ==================== 应用自定义配置 ====================
+purify:
+  sensitive-word:
+    enabled: true
+    # 命中任意一个词就直接拦截，不会发起模型调用
+    words:
+      - 自杀
+      - 自残
+      - 催吐
+      - 暴食
+      - 厌食
+      - 减肥药
+      - 泻药
+      - 绝食
+    reply-message: "你提到的情况已经超出我作为健康顾问能处理的范围了。比起体重，你的身心健康更重要，建议尽快联系专业医生或心理咨询师聊一聊。全国心理援助热线：12356。"
+
+  # ---------------- Prompt 模板 ----------------
+  prompt:
+    # 模板目录；模板名 = 文件名去掉 .st 后缀
+    location: classpath:prompts/
+    # slim-app-system.st 里 {nickname} 的取值
+    nickname: 朋友
+
+  # ---------------- 多模态（看图） ----------------
+  vision:
+    # 文本模型 qwen-plus 不读图，图片必须交给 VL 系列模型
+    model: qwen-vl-max
+    # 体检单、运动记录截图这类小字图需要高分辨率，普通照片可以关掉省 token
+    high-resolution-images: true
+
+  # ---------------- RAG：百炼云知识库 ----------------
+  # 切片、向量、索引、重排都在百炼侧托管，本地不建向量库、不装 Embedding 模型
+  rag:
+    # 检索服务出问题时的应急开关：关掉后链路退化成纯模型对话，其余功能不受影响
+    enabled: true
+    # 百炼控制台里的知识库名称，必须一字不差。
+    # 名字写错不会在启动时报错，要等第一次提问才抛 DashScopeException: Index:xxx NotExist
+    index-name: 瘦身大师
+    # 业务空间 ID。主账号默认空间留空即可，填了会作为 X-DashScope-WorkSpace 请求头发出去
+    workspace-id:
+    # 召回条数：向量与关键词各自召回多少条，两者之和不超过 200
+    # 注意：当前版本的 SDK 在拼请求时把 dense 的值填了两次（源码 DashScopeApi#retriever），
+    # 所以 sparse 这一项实际不生效，调它没用，真正起作用的是 dense。
+    dense-similarity-top-k: 100
+    sparse-similarity-top-k: 100
+    # 多轮改写：开启后检索时会把对话历史一起带过去，指代消解（“那它呢？”）更准
+    enable-rewrite: false
+    # 重排序：召回质量更好，代价是每次检索多一次模型调用
+    enable-reranking: true
+    rerank-model-name: gte-rerank-hybrid
+    # 相似度阈值，调高可以压掉不相关的切片；调太高会一条都召不回来
+    rerank-min-score: 0.01
+    # 最终拼进 Prompt 的切片条数，这是最值得调的参数：少了答不全，多了被噪声带偏
+    rerank-top-n: 5
+    # 引用标注（<ref>[1]</ref>）。默认关：开启后收尾逻辑会在 finishReason 为 null 时抛 NPE，
+    # 流式链路必崩，要开建议只在阻塞式接口上开
+    enable-reference: false
+
+    # ---------------- 检索路由：先判断该不该查、该查哪一类 ----------------
+    # 没有路由的话，每问一句（包括「你好」）都会把整个知识库捞一遍：一次向量召回 +
+    # 一次重排序模型调用。路由用纯字符串匹配做判断，本身不产生任何开销。
+    router:
+      enabled: true
+      # 百炼控制台里给切片打的元数据字段名，必须一字不差
+      filter-key: classification
+      # 分类表。value 必须与控制台里该字段的取值一字不差，否则过滤条件查不到东西；
+      # keywords 是「提问里包含即算命中」，宁可略宽，别漏。
+      # 同时命中多个分类时按「不带过滤查全库」处理：带不带过滤都是一次请求，开销一样，
+      # 而一次请求最多只能按一个字段的一个值过滤，为多分类再发一次请求反而更费。
+      categories:
+        - value: 食物热量
+          keywords:
+            - 吃
+            - 喝
+            - 热量
+            - 卡路里
+            - 大卡
+            - 千卡
+            - 食谱
+            - 饮食
+            - 餐
+            - 主食
+            - 碳水
+            - 蛋白质
+            - 脂肪
+            - 蔬菜
+            - 水果
+            - 肉
+            - 蛋
+            - 奶
+            - 奶茶
+            - 饮料
+            - 零食
+            - 外卖
+            - 代餐
+        - value: 运动热量
+          keywords:
+            - 运动
+            - 锻炼
+            - 健身
+            - 跑步
+            - 慢跑
+            - 快走
+            - 走路
+            - 散步
+            - 跳绳
+            - 游泳
+            - 骑车
+            - 单车
+            - 瑜伽
+            - 拉伸
+            - 力量训练
+            - 有氧
+            - 无氧
+            - 燃脂
+            - 消耗
+            - 步数
+            - 撸铁
+        - value: 药物
+          keywords:
+            - 药
+            - 用药
+            - 副作用
+            - 禁忌
+            - 说明书
+            - 奥利司他
+            - 二甲双胍
+            - 司美格鲁肽
+            - 保健品
+            - 维生素
+            - 益生菌
+      # 一个分类都没命中时：false=压根不查（默认，最省资源），true=不带过滤查全库。
+      # 「我想瘦十斤」这种没写明吃/动/药的问题会被 false 跳过，
+      # 如果发现这类问题答得不好，改成 true。
+      query-all-when-unmatched: false
+
+logging:
+  level:
+    com.purify.purifyaiagent: debug
