@@ -1,0 +1,36 @@
+package com.purify.purifyaiagent.config;
+
+import com.purify.purifyaiagent.advisor.LoggingAdvisor;
+import com.purify.purifyaiagent.advisor.ReReadingAdvisor;
+import com.purify.purifyaiagent.advisor.SensitiveWordAdvisor;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+/**
+ * 自定义 Advisor 的装配。
+ *
+ * <p>Advisor 本身写成普通类（构造注入依赖、方便单元测试），
+ * 由这里统一注册成 Bean，再在 {@code SlimApp} 里按需组装进 ChatClient。
+ * 这样同一个 Advisor 可以被多个应用复用，也便于按应用裁剪。
+ */
+@Configuration
+public class AdvisorConfig {
+
+    @Bean
+    public SensitiveWordAdvisor sensitiveWordAdvisor(SensitiveWordProperties properties) {
+        return new SensitiveWordAdvisor(
+                properties.getWords(),
+                properties.getReplyMessage(),
+                properties.isEnabled());
+    }
+
+    @Bean
+    public ReReadingAdvisor reReadingAdvisor() {
+        return new ReReadingAdvisor();
+    }
+
+    @Bean
+    public LoggingAdvisor loggingAdvisor() {
+        return new LoggingAdvisor();
+    }
+}
