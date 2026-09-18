@@ -1,3 +1,7 @@
+##CUSTOM##
+# 本地真实密钥。任何存密钥的文件都按 "*.local.yml" / ".env*" 命名，靠模式统一挡住，
+# 免得以后新建一个 application-prod.yml 之类又忘了加。
+application-local.yml
 HELP.md
 target/
 .mvn/wrapper/maven-wrapper.jar

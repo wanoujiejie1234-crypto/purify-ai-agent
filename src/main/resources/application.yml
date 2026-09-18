@@ -1,3 +1,7 @@
+spring:
+  profiles:
+    active: local
+
 server:
   port: 8080
 
@@ -12,14 +16,6 @@ spring:
       max-file-size: 10MB
       max-request-size: 12MB
 
-  # ==================== 数据源：对话记忆持久化到本地 MySQL ====================
-  datasource:
-    # createDatabaseIfNotExist=true：库不存在时自动创建，换机器也能直接跑起来
-    url: jdbc:mysql://localhost:3306/purify_ai_agent?createDatabaseIfNotExist=true&useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
-    username: root
-    password: 12345
-    driver-class-name: com.mysql.cj.jdbc.Driver
-
   ai:
     # ---------------- 对话记忆：官方 JdbcChatMemoryRepository ----------------
     chat:
@@ -32,9 +28,6 @@ spring:
             schema: classpath:db/chat-memory-schema-mysql.sql
     # ---------------- 通义千问 DashScope ----------------
     dashscope:
-      api-key: "sk-61cbfece8da24d2680c10b897fc7cbb6"
-      # 原生 SDK 的根地址；带 /compatible-mode/v1 的是 OpenAI 兼容模式，此处不适用
-      base-url: https://dashscope.aliyuncs.com
       chat:
         options:
           model: qwen-plus
@@ -78,8 +71,6 @@ purify:
     # 百炼控制台里的知识库名称，必须一字不差。
     # 名字写错不会在启动时报错，要等第一次提问才抛 DashScopeException: Index:xxx NotExist
     index-name: 瘦身大师
-    # 业务空间 ID。主账号默认空间留空即可，填了会作为 X-DashScope-WorkSpace 请求头发出去
-    workspace-id:
     # 召回条数：向量与关键词各自召回多少条，两者之和不超过 200
     # 注意：当前版本的 SDK 在拼请求时把 dense 的值填了两次（源码 DashScopeApi#retriever），
     # 所以 sparse 这一项实际不生效，调它没用，真正起作用的是 dense。
