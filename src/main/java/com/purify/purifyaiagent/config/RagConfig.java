@@ -1,100 +1,51 @@
 package com.purify.purifyaiagent.config;
 
 import com.alibaba.cloud.ai.dashscope.api.DashScopeApi;
-import com.alibaba.cloud.ai.dashscope.rag.DashScopeDocumentRetrievalAdvisor;
 import com.alibaba.cloud.ai.dashscope.rag.DashScopeDocumentRetriever;
 import com.alibaba.cloud.ai.dashscope.rag.DashScopeDocumentRetrieverOptions;
+import com.purify.purifyaiagent.rag.KnowledgeBaseAdvisor;
 import com.purify.purifyaiagent.rag.KnowledgeRouter;
+import com.purify.purifyaiagent.rag.RagPrompts;
 import com.purify.purifyaiagent.rag.RoutingDocumentRetriever;
 import com.purify.purifyaiagent.rag.RoutingKnowledgeBaseAdvisor;
-import org.springframework.ai.chat.prompt.PromptTemplate;
 import org.springframework.ai.rag.retrieval.search.DocumentRetriever;
-import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.util.Assert;
-import org.springframework.web.client.RestClient;
-import org.springframework.web.reactive.function.client.WebClient;
 
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 /**
- * 云知识库 RAG 装配：把百炼上的知识库（「瘦身大师」）接成 Advisor 链上的一环。
+ * 百炼「云知识库」链路：把百炼上的知识库（「瘦身大师」）接成 Advisor 链上的一环。
  *
  * <p>整条链路是这样串起来的：
  * <pre>
- *   DashScopeApi                        发 HTTP 的客户端，只用到它的 restClient
+ *   DashScopeApi                        发 HTTP 的客户端（在 RagCommonConfig 里）
  *     └── DashScopeDocumentRetriever    按知识库名字检索，返回命中的切片
  *           └── RoutingDocumentRetriever   按分类分发到上面某一个检索器
  *                 └── RoutingKnowledgeBaseAdvisor
  *                                      before 阶段先路由，再检索，最后把切片拼进用户消息
  * </pre>
  *
- * <p><b>为什么本地不建向量库/不装 Embedding 模型</b>：切片与向量都存在百炼，
- * 检索也是一次远程调用，所以 {@code spring-ai-starter-vector-store-*} 和
- * {@code spring-ai-starter-model-*} 这些依赖一个都不需要加。
+ * <p><b>这条链路本地不做向量化</b>：切片与向量都存在百炼，检索也是一次远程调用，
+ * 所以不需要 {@code spring-ai-starter-vector-store-*} 之类的依赖。
+ * 想改成「文档、切片、向量都在本地 PostgreSQL 里」的话，把
+ * {@code purify.rag.store} 改成 {@code pgvector}，装配会切到
+ * {@link PgVectorRagConfig}——两条链路产出的都是 {@link KnowledgeBaseAdvisor}，
+ * 上层（{@code SlimApp}）不需要知道下面换过。
  *
- * <p>整个类受 {@code purify.rag.enabled} 控制：关掉时这几个 Bean 都不创建，
- * {@code SlimApp} 通过 {@link ObjectProvider} 拿不到就把这一环跳过，应用照常启动。
+ * <p>本类受两个条件共同控制：{@code purify.rag.enabled} 且
+ * {@code purify.rag.store=bailian}（<b>带 {@code matchIfMissing}，不写 store 时默认走这条</b>，
+ * 保证这次的改动对既有行为零影响）。两个条件都写在类上——{@code @ConditionalOnProperty}
+ * 在 Spring Boot 3.5 是可重复标注的。
  */
 @Configuration
 @ConditionalOnProperty(prefix = "purify.rag", name = "enabled", havingValue = "true", matchIfMissing = true)
+@ConditionalOnProperty(prefix = "purify.rag", name = "store", havingValue = "bailian", matchIfMissing = true)
 public class RagConfig {
-
-    /**
-     * 拼给模型的用户消息模板。
-     *
-     * <p>{@code {context}} 和 {@code {query}} 两个占位符一个都不能少：
-     * 构造 {@code ContextualQueryAugmenter} 时会做校验，缺了直接抛异常；
-     * 反过来，模板里多写的花括号也会被当成占位符而报「变量未替换」。
-     */
-    private static final PromptTemplate RAG_USER_TEXT_ADVISE = new PromptTemplate("""
-            # 知识库
-            下面是知识库中检索到的材料，请优先依据它们回答。
-
-            要求：
-            1. 材料里有答案时，就按材料说，不要自行发挥；
-            2. 材料里没有答案时，直接说明知识库中没有相关内容，再给一般性的健康建议；
-            3. 不要提「根据材料」「根据上下文」这类话，直接给结论。
-
-            $$材料：
-            {context}
-
-            问题：{query}
-
-            答案：
-            """);
-
-    /**
-     * 专供检索使用的 DashScopeApi。
-     *
-     * <p>模型自动配置里那个 DashScopeApi 是在方法内部 new 出来的局部对象，容器里取不到，
-     * 所以这里按同样的连接参数另建一个。它只用 restClient（检索是普通 HTTP 接口），
-     * 不参与任何模型调用，因此和对话链路上的那个 API 客户端互不影响。
-     */
-    @Bean
-    public DashScopeApi ragDashScopeApi(DashScopeProperties dashScopeProperties,
-                                        RagProperties ragProperties,
-                                        ObjectProvider<RestClient.Builder> restClientBuilder,
-                                        ObjectProvider<WebClient.Builder> webClientBuilder) {
-        return DashScopeApi.builder()
-                .apiKey(dashScopeProperties.getApiKey())
-                .baseUrl(dashScopeProperties.getBaseUrl())
-                // 空字符串等于不传，不会多带一个 Workspace 请求头
-                .workSpaceId(ragProperties.getWorkspaceId())
-                .restClientBuilder(restClientBuilder.getIfAvailable(RestClient::builder))
-                .webClientBuilder(webClientBuilder.getIfAvailable(WebClient::builder))
-                .build();
-    }
-
-    /** 关键词路由：判定「要不要查、查哪一类」，纯字符串匹配，不产生任何远程开销。 */
-    @Bean
-    public KnowledgeRouter knowledgeRouter(RagProperties ragProperties) {
-        return new KnowledgeRouter(ragProperties);
-    }
 
     /**
      * 知识库检索器。
@@ -127,16 +78,25 @@ public class RagConfig {
      * <p>order 必须显式传。不传的话这个类会退化成默认的 0，
      * 和 {@code SensitiveWordAdvisor} 撞在一起，谁先执行就取决于排序是否稳定了。
      *
-     * <p>返回类型写成父类 {@link DashScopeDocumentRetrievalAdvisor}：
-     * 调用方（{@code SlimApp}）只当它是个检索 Advisor，不需要知道里面多了路由这件事。
+     * <p><b>返回类型写成 {@link KnowledgeBaseAdvisor} 而不是具体类</b>是有意的：
+     * {@code SlimApp} 是按这个接口类型注入的，而 Spring 判断一个 {@code @Bean} 能不能
+     * 匹配上用的是<b>方法声明的返回类型</b>（不会为了匹配去实例化它）。返回类型写成
+     * {@code DashScopeDocumentRetrievalAdvisor} 的话匹配不上，{@code SlimApp} 里的
+     * {@code ifAvailable} 会安静地跳过——表现就是「RAG 没生效，但什么都不报」，
+     * 属于最难查的一类故障。
+     *
+     * <p><b>Bean 名与 pgvector 链路刻意保持一致</b>：两条链路互斥，正常只会有一个。
+     * 万一将来条件写错导致两个同时命中，Boot 默认禁止 Bean 定义覆盖，
+     * 会在启动期直接抛 {@code BeanDefinitionOverrideException}——比留到注入阶段
+     * 报含糊的 {@code NoUniqueBeanDefinitionException} 更容易定位。
      */
     @Bean
-    public DashScopeDocumentRetrievalAdvisor knowledgeBaseRetrievalAdvisor(
+    public KnowledgeBaseAdvisor knowledgeBaseRetrievalAdvisor(
             DocumentRetriever bailianDocumentRetriever,
             RagProperties ragProperties,
             KnowledgeRouter knowledgeRouter) {
         return new RoutingKnowledgeBaseAdvisor(bailianDocumentRetriever,
-                RAG_USER_TEXT_ADVISE,
+                RagPrompts.USER_TEXT_ADVISE,
                 ragProperties.isEnableReference(),
                 ragProperties.getOrder(),
                 knowledgeRouter,

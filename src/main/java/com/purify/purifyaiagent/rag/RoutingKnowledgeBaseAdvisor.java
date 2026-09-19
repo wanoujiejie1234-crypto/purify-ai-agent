@@ -15,8 +15,6 @@ import org.springframework.lang.Nullable;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.function.Function;
-import java.util.stream.Collectors;
 
 import static com.alibaba.cloud.ai.dashscope.common.DashScopeApiConstants.RETRIEVED_DOCUMENTS;
 
@@ -39,24 +37,13 @@ import static com.alibaba.cloud.ai.dashscope.common.DashScopeApiConstants.RETRIE
  *
  * <p>检索本身交给 {@link RoutingDocumentRetriever}：路由结果放在
  * {@link Query#context()} 里传下去，由它决定用哪一个过滤条件。
+ *
+ * <p>实现 {@link KnowledgeBaseAdvisor} 是为了让 {@code SlimApp} 能用同一个类型
+ * 装上两条链路（百炼 / 本地 pgvector）中当前生效的那一个，理由见该接口的注释。
+ * 切片拼进 Prompt 的格式与提示词统一放在 {@link RagPrompts}。
  */
 @Slf4j
-public class RoutingKnowledgeBaseAdvisor extends DashScopeDocumentRetrievalAdvisor {
-
-    /**
-     * 切片拼进 Prompt 的格式。
-     *
-     * <p>必须和父类里的那份保持一致：模型的提示词是按这个格式调的，
-     * 改了格式等于换了提示词。父类那份是私有的，这里只能照抄一份。
-     */
-    private static final Function<List<Document>, String> DOCUMENT_FORMATTER = documents -> documents.stream()
-            .map(document -> """
-                    [%s] 【文档名】%s
-                    【标题】%s
-                    【正文】%s
-                    """.formatted(document.getMetadata().get("index_id"), document.getMetadata().get("doc_name"),
-                    document.getMetadata().get("title"), document.getText()))
-            .collect(Collectors.joining(System.lineSeparator()));
+public class RoutingKnowledgeBaseAdvisor extends DashScopeDocumentRetrievalAdvisor implements KnowledgeBaseAdvisor {
 
     private final DocumentRetriever retriever;
 
@@ -73,7 +60,7 @@ public class RoutingKnowledgeBaseAdvisor extends DashScopeDocumentRetrievalAdvis
         this.retriever = retriever;
         this.queryAugmenter = ContextualQueryAugmenter.builder()
                 .promptTemplate(userTextAdvise)
-                .documentFormatter(DOCUMENT_FORMATTER)
+                .documentFormatter(RagPrompts.DOCUMENT_FORMATTER)
                 .build();
         this.router = router;
         this.routerEnabled = routerEnabled;

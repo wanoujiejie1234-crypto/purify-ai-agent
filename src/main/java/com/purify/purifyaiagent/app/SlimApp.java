@@ -1,14 +1,16 @@
 package com.purify.purifyaiagent.app;
 
 import com.alibaba.cloud.ai.dashscope.chat.DashScopeChatOptions;
-import com.alibaba.cloud.ai.dashscope.rag.DashScopeDocumentRetrievalAdvisor;
 import com.purify.purifyaiagent.advisor.LoggingAdvisor;
 import com.purify.purifyaiagent.advisor.ReReadingAdvisor;
 import com.purify.purifyaiagent.advisor.SensitiveWordAdvisor;
 import com.purify.purifyaiagent.config.PromptProperties;
+import com.purify.purifyaiagent.config.RagProperties;
 import com.purify.purifyaiagent.config.VisionProperties;
 import com.purify.purifyaiagent.model.SlimPlan;
 import com.purify.purifyaiagent.prompt.PromptTemplateLoader;
+import com.purify.purifyaiagent.rag.KnowledgeBaseAdvisor;
+import com.purify.purifyaiagent.tools.UserProfileTool;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
@@ -17,6 +19,7 @@ import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.template.NoOpTemplateRenderer;
+import org.springframework.ai.tool.ToolCallbackProvider;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.core.io.Resource;
 import org.springframework.stereotype.Component;
@@ -44,7 +47,7 @@ import java.util.UUID;
  * <pre>
  *   MessageChatMemoryAdvisor (order ≈ Integer.MIN_VALUE)
  *     └── SensitiveWordAdvisor (0)      命中高危词直接拦截
- *           └── DashScopeDocumentRetrievalAdvisor (5)  查百炼云知识库，把切片拼进用户消息
+ *           └── KnowledgeBaseAdvisor (5)  查知识库，把切片拼进用户消息
  *                                                      （内置关键词路由：不相关的不查，只涉及一类时只查这一类）
  *                 └── ReReadingAdvisor (10)   改写最后一条用户消息
  *                       └── LoggingAdvisor (20)  记录发给模型的完整内容与耗时
@@ -59,13 +62,24 @@ import java.util.UUID;
  * 后面的 Advisor 看到的才是「带上下文」的完整请求；同时它记录进库的也是用户原始输入，
  * 不会被 Re-Reading 追加的指令污染。
  *
+ * <p><b>工具</b>：模型能调哪些工具，全部由 {@code ToolConfig} 一处登记，这里只收一个
+ * {@link ToolCallbackProvider}，不引用任何一个具体工具类——加工具不用改这个文件。
+ * 工具挂上之后，「制定方案前先读用户画像」是模型照着工具描述自己做的决定，
+ * 不是这里写死的流程；模型要靠 {@link #toolContext} 才知道现在说话的是谁，
+ * 那几个入口一个都不能漏，原因见那个方法的注释。
+ *
  * <p><b>多模态</b>：{@link #explainImage} 走的是另一个 ChatClient（同一个 ChatModel，
  * 但换成 VL 模型名），Advisor 链与文本对话完全一致——也就是说看图同样有记忆、
  * 有敏感词拦截、有日志、也会去查一次知识库。
  *
- * <p><b>知识库（RAG）是可选的</b>：{@code purify.rag.enabled=false} 时容器里不存在
- * {@link DashScopeDocumentRetrievalAdvisor}，这里靠 {@link ObjectProvider} 拿不到就跳过，
- * 链路退化成纯模型对话，应用照常启动——这样检索服务抖动时不用改代码就能降级。
+ * <p><b>知识库（RAG）是可选的，而且是可换的</b>：具体用哪一条链路由
+ * {@code purify.rag.store} 决定（百炼云知识库 / 本地 pgvector），两条链路产出的都是
+ * {@link KnowledgeBaseAdvisor}，这里按这个接口注入、拿不到就跳过。所以：
+ * <ul>
+ *   <li>{@code purify.rag.enabled=false} 或条件没配对上时，容器里没有这个 Bean，
+ *       链路退化成纯模型对话，应用照常启动——检索服务抖动时不用改代码就能降级；</li>
+ *   <li>换 store 只影响下面查到的是谁，这个类的代码一个字都不用动。</li>
+ * </ul>
  */
 @Slf4j
 @Component
@@ -94,10 +108,12 @@ public class SlimApp {
                    SensitiveWordAdvisor sensitiveWordAdvisor,
                    ReReadingAdvisor reReadingAdvisor,
                    LoggingAdvisor loggingAdvisor,
-                   ObjectProvider<DashScopeDocumentRetrievalAdvisor> knowledgeBaseAdvisor,
+                   ObjectProvider<KnowledgeBaseAdvisor> knowledgeBaseAdvisor,
+                   ToolCallbackProvider agentTools,
                    PromptTemplateLoader promptTemplateLoader,
                    PromptProperties promptProperties,
-                   VisionProperties visionProperties) {
+                   VisionProperties visionProperties,
+                   RagProperties ragProperties) {
         this.chatMemory = chatMemory;
         this.promptTemplateLoader = promptTemplateLoader;
         this.promptProperties = promptProperties;
@@ -109,12 +125,18 @@ public class SlimApp {
                 reReadingAdvisor,
                 loggingAdvisor));
         // 知识库没启用时容器里没有这个 Bean，ifAvailable 会安静地跳过，
-        // 而不是像直接注入那样让整个应用启动失败
-        knowledgeBaseAdvisor.ifAvailable(advisors::add);
+        // 而不是像直接注入那样让整个应用启动失败。
+        // 拿到的这个引用还要用于下面的启动日志，所以只取一次，不重复调用 getIfAvailable
+        KnowledgeBaseAdvisor ragAdvisor = knowledgeBaseAdvisor.getIfAvailable();
+        if (ragAdvisor != null) {
+            advisors.add(ragAdvisor);
+        }
         advisors.add(MessageChatMemoryAdvisor.builder(chatMemory).build());
 
         this.chatClient = ChatClient.builder(chatModel)
                 .defaultAdvisors(advisors)
+                // 工具来自 ToolConfig 这一个注册表，这里不关心具体有哪些
+                .defaultToolCallbacks(agentTools)
                 // 模板统一由 PromptTemplateLoader 渲染，这里关掉 ChatClient 的二次渲染：
                 // 否则用户输入里出现的半角花括号会被当成模板变量，直接抛「变量未替换」的异常
                 .defaultTemplateRenderer(new NoOpTemplateRenderer())
@@ -122,6 +144,7 @@ public class SlimApp {
 
         this.visionChatClient = ChatClient.builder(chatModel)
                 .defaultAdvisors(advisors)
+                .defaultToolCallbacks(agentTools)
                 .defaultTemplateRenderer(new NoOpTemplateRenderer())
                 // 换模型只影响「读不读得懂图」，其余链路不变；
                 // 这里没写的参数（如 temperature）会与 application.yml 里的默认值合并
@@ -137,10 +160,27 @@ public class SlimApp {
                         .build())
                 .build();
 
-        log.info("[SlimApp] 初始化完成：对话记忆 + 敏感词拦截 + Re-Reading + 日志{}，共 {} 个 Advisor；看图模型={}",
-                knowledgeBaseAdvisor.getIfAvailable() == null ? "" : " + 云知识库检索(RAG)",
+        // 启动日志打的是「实际有没有装上」，而不是「配置里写了什么」——这两者会不一致：
+        // purify.rag.store 大小写写错（比如 PGVECTOR）时两个配置类都不装配、Advisor 根本不存在，
+        // 但配置值读出来仍是 PGVECTOR。只念配置的话，日志会理直气壮地说「知识库=PGVECTOR」，
+        // 而对话其实一个字都没查过知识库。
+        String ragState = ragAdvisor == null ? "未接入" : "已接入/" + ragProperties.getStore();
+        log.info("[SlimApp] 初始化完成：对话记忆 + 敏感词拦截 + Re-Reading + 日志{}，共 {} 个 Advisor；"
+                        + "工具 {} 个；看图模型={}；知识库={}",
+                ragAdvisor == null ? "" : " + 知识库检索(RAG)",
                 advisors.size(),
-                visionProperties.getModel());
+                agentTools.getToolCallbacks().length,
+                visionProperties.getModel(),
+                ragState);
+
+        // 开着 RAG 却一个 Advisor 都没有，只可能是配置写错了（enabled=true 且 store 合法时，
+        // 两个配置类必有一个生效）。这时对话会静默退化成纯模型闲聊，不说一声很难发现。
+        // 不直接启动失败，是为了保住 purify.rag.enabled 这条应急降级路径
+        if (ragProperties.isEnabled() && ragAdvisor == null) {
+            log.warn("[SlimApp] purify.rag.enabled=true 但知识库检索 Advisor 没有装配上："
+                    + "对话不会查任何知识库。多半是 purify.rag.store 的值不合法（必须是全小写的 "
+                    + "bailian 或 pgvector），当前读到的是「{}」", ragProperties.getStore());
+        }
     }
 
     /** 生成一个新的会话 ID。长度固定 36，与 SPRING_AI_CHAT_MEMORY.conversation_id 列宽一致。 */
@@ -159,6 +199,7 @@ public class SlimApp {
                 .system(renderSystemPrompt())
                 .user(message)
                 .advisors(spec -> spec.param(ChatMemory.CONVERSATION_ID, chatId))
+                .toolContext(toolContext(chatId))
                 .call()
                 .content();
     }
@@ -169,6 +210,7 @@ public class SlimApp {
                 .system(renderSystemPrompt())
                 .user(message)
                 .advisors(spec -> spec.param(ChatMemory.CONVERSATION_ID, chatId))
+                .toolContext(toolContext(chatId))
                 .stream()
                 .content();
     }
@@ -184,6 +226,7 @@ public class SlimApp {
                 .system(renderSystemPrompt())
                 .user(message)
                 .advisors(spec -> spec.param(ChatMemory.CONVERSATION_ID, chatId))
+                .toolContext(toolContext(chatId))
                 .call()
                 .entity(SlimPlan.class);
     }
@@ -212,6 +255,7 @@ public class SlimApp {
                 .system(promptTemplateLoader.render(VISION_SYSTEM_TEMPLATE, Map.of()))
                 .user(spec -> spec.text(userText).media(mimeType, image))
                 .advisors(spec -> spec.param(ChatMemory.CONVERSATION_ID, chatId))
+                .toolContext(toolContext(chatId))
                 .call()
                 .content();
     }
@@ -225,7 +269,6 @@ public class SlimApp {
     public void clearHistory(String chatId) {
         chatMemory.clear(chatId);
     }
-
     /**
      * 渲染系统提示词。
      *
@@ -236,5 +279,24 @@ public class SlimApp {
         return promptTemplateLoader.render(SYSTEM_TEMPLATE, Map.of(
                 "nickname", promptProperties.getNickname(),
                 "today", LocalDate.now().toString()));
+    }
+
+    /**
+     * 每个请求都要带的工具上下文，用来回答工具那句「现在跟我说话的是谁」。
+     *
+     * <p>这个值不会出现在工具的 JSON Schema 里，也就是模型看不到、更传不了它——
+     * 这正是我们要的：用户身份不能由模型自己填，否则它会编一个出来，
+     * 这次存下的画像下次就找不回来了。
+     *
+     * <p><b>四个对话入口一个都不能漏。</b>凡是声明了 {@code ToolContext} 参数的工具，
+     * 在没有上下文的请求里被调用时，Spring AI 会直接抛
+     * {@code IllegalArgumentException: ToolContext is required by the method as an argument}——
+     * 也就是说漏掉这一行不是「画像读不到」，而是整个对话直接失败。
+     *
+     * <p>目前用会话 ID 当用户标识（这个项目还没有登录体系）。客户端复用同一个 chatId
+     * 就能跨轮次记住画像；将来接入登录后，这里换成真实用户 ID 即可，工具本身不用动。
+     */
+    private static Map<String, Object> toolContext(String chatId) {
+        return Map.of(UserProfileTool.USER_ID_KEY, chatId);
     }
 }

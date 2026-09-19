@@ -1,7 +1,9 @@
 package com.purify.purifyaiagent.controller;
 
+import com.purify.purifyaiagent.exception.DocumentIndexException;
 import com.purify.purifyaiagent.exception.InvalidImageException;
 import com.purify.purifyaiagent.exception.SensitiveWordException;
+import com.purify.purifyaiagent.exception.UnsupportedDocumentException;
 import com.purify.purifyaiagent.model.ErrorReply;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
@@ -36,5 +38,29 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorReply> handleInvalidImage(InvalidImageException exception) {
         log.warn("图片校验不通过：{}", exception.getMessage());
         return ResponseEntity.badRequest().body(new ErrorReply("INVALID_IMAGE", exception.getMessage()));
+    }
+
+    /**
+     * 知识库文档不收：格式、体积、分类值等入口处的校验没过。
+     *
+     * <p>和图片一样属于「客户端传错了东西」，返回 400 并原样带上原因——
+     * 这些消息都是写给上传的人看的，比如「只支持 txt/md」或者「未知的分类」。
+     */
+    @ExceptionHandler(UnsupportedDocumentException.class)
+    public ResponseEntity<ErrorReply> handleUnsupportedDocument(UnsupportedDocumentException exception) {
+        log.warn("文档未被接受：{}", exception.getMessage());
+        return ResponseEntity.badRequest().body(new ErrorReply("UNSUPPORTED_DOCUMENT", exception.getMessage()));
+    }
+
+    /**
+     * 文档收下了但索引建不下去：内容为空、不是 UTF-8、切片数撞上上限。
+     *
+     * <p>同样是文档本身的问题，所以也是 400；真正服务端的故障（比如向量库连不上）
+     * 会是 {@code DataAccessException} 之类，不在这里拦，照旧走 500。
+     */
+    @ExceptionHandler(DocumentIndexException.class)
+    public ResponseEntity<ErrorReply> handleDocumentIndex(DocumentIndexException exception) {
+        log.warn("文档建索引失败：{}", exception.getMessage());
+        return ResponseEntity.badRequest().body(new ErrorReply("DOCUMENT_INDEX_FAILED", exception.getMessage()));
     }
 }

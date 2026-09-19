@@ -9,11 +9,23 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 百炼「云知识库」RAG 配置，对应 application.yml 中的 {@code purify.rag.*}。
+ * RAG 配置，对应 application.yml 中的 {@code purify.rag.*}。
  *
- * <p>这里配的是 RAG 里「检索」这一环：文档解析、切片、向量化、建索引、重排序
- * 全部由百炼托管，本地既不需要向量数据库，也不需要 Embedding 模型，
- * 只负责把提问发给检索接口、把命中的切片拼进 Prompt。
+ * <p>知识库有<b>两条可以互相替代的链路</b>，用 {@link #store} 选其中一条：
+ * <ul>
+ *   <li>{@link Store#BAILIAN}（默认）—— 百炼云知识库。文档解析、切片、向量化、建索引、
+ *       重排序全部由百炼托管，本地不建向量库、不装 Embedding 模型，
+ *       只负责把提问发给检索接口、把命中的切片拼进 Prompt。</li>
+ *   <li>{@link Store#PGVECTOR} —— 本地自建。文档由上传接口进来，本地切片、
+ *       调 DashScope 的 Embedding 接口向量化、存进 PostgreSQL 的 pgvector 扩展，
+ *       检索时本地算相似度再交给重排模型精排。配置在
+ *       {@code purify.rag.pgvector.*}（见 {@link PgVectorProperties}）。</li>
+ * </ul>
+ *
+ * <p>两条链路共用的东西放在本类里：路由（{@code router.*}）、重排开关与阈值
+ * （{@code enable-reranking} / {@code rerank-min-score} / {@code rerank-top-n}）、
+ * Advisor 顺序（{@code order}）。只有百炼专有的参数（知识库名、workspace、
+ * 百炼平台的重排模型名）才留在本类中由百炼链路单独使用。
  *
  * <p>之所以把这些参数从代码搬到 yml，是因为调 RAG 效果基本就是在调召回：
  * 召回太少答不全、太多又会被噪声带偏，这些数字需要边试边改，不该每次重新打包。
@@ -24,12 +36,43 @@ import java.util.List;
 public class RagProperties {
 
     /**
+     * 用哪一条知识库链路。
+     *
+     * <p>用枚举而不是字符串，是为了拿到「配错就在启动期报错」这个行为：
+     * {@code store: pgvectr} 这种拼写错误会让 Spring 在绑定期抛 {@code BindException}，
+     * 而不是两条链路都不装配、RAG 悄悄消失（那是最难查的一种故障）。
+     *
+     * <p>唯一的漏网之鱼是大小写：枚举绑定本身很宽松，但配置类上的
+     * {@code @ConditionalOnProperty} 是拿原始字符串比对的，所以 yml 里必须写小写。
+     * 为此两个 RAG 配置类都会在启动日志里打出「当前生效的是哪一条链路」。
+     */
+    public enum Store {
+
+        /** 百炼云知识库：切片与向量都在云端，本地不做向量化。 */
+        BAILIAN,
+
+        /** 本地 pgvector：文档、切片、向量都在本地的 PostgreSQL 里。 */
+        PGVECTOR
+    }
+
+    /**
      * 是否启用知识库检索。
      *
      * <p>关掉后 Advisor 链上只是少一环，普通对话、看图、结构化输出都不受影响，
      * 可以当作「检索接口出问题时」的应急开关。
+     *
+     * <p>{@code store=pgvector} 时这个开关还有第二层意义：pgvector 链路是<b>启动期</b>
+     * 就要连 PostgreSQL 建表/校验的，数据库连不上会让整个应用起不来。
+     * 这时把 {@code enabled} 关掉（或退回 {@code store=bailian}）就是恢复启动的逃生口。
      */
     private boolean enabled = true;
+
+    /**
+     * 用哪一条链路，默认百炼——保证不写这一项时的行为与加它之前完全一致。
+     *
+     * <p>取值必须小写：{@code bailian} 或 {@code pgvector}。
+     */
+    private Store store = Store.BAILIAN;
 
     /**
      * 百炼控制台里创建好的知识库名称，必须一字不差（本项目的知识库叫「瘦身大师」）。

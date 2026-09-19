@@ -1,11 +1,9 @@
-spring:
-  profiles:
-    active: local
 
 server:
   port: 8080
-
 spring:
+  profiles:
+    active: local
   application:
     name: purify-ai-agent
 
@@ -15,6 +13,16 @@ spring:
       # 手机拍的照片动辄 3~8MB，用默认的 1MB 会直接被 MaxUploadSizeExceededException 拒掉
       max-file-size: 10MB
       max-request-size: 12MB
+
+  # ==================== 建表：用户画像 ====================
+  # 对话记忆那张表由 Spring AI 自己管（见下面的 spring.ai.chat.memory.repository.jdbc），
+  # 用户画像这两张表是项目自己的，交给 Boot 的脚本初始化。
+  # mode 的默认值是 embedded——只对内存库生效，MySQL 必须显式改成 always。
+  # 脚本里每条语句都带 IF NOT EXISTS：重复启动不会报错，更不会清掉已经存下的画像。
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:db/user-profile-schema-mysql.sql
 
   ai:
     # ---------------- 对话记忆：官方 JdbcChatMemoryRepository ----------------
@@ -49,6 +57,13 @@ purify:
       - 绝食
     reply-message: "你提到的情况已经超出我作为健康顾问能处理的范围了。比起体重，你的身心健康更重要，建议尽快联系专业医生或心理咨询师聊一聊。全国心理援助热线：12356。"
 
+  # ---------------- 应用自身的对外地址 ----------------
+  # 下载工具要把本地文件变成一个用户点得开的链接，而它不在 HTTP 请求上下文里，
+  # 拿不到当前请求的 Host，所以这个前缀只能配。
+  # 部署到别的机器或改了端口记得同步改，否则链接会指向 localhost，用户点开是空的。
+  server:
+    base-url: http://localhost:8080
+
   # ---------------- Prompt 模板 ----------------
   prompt:
     # 模板目录；模板名 = 文件名去掉 .st 后缀
@@ -63,11 +78,21 @@ purify:
     # 体检单、运动记录截图这类小字图需要高分辨率，普通照片可以关掉省 token
     high-resolution-images: true
 
-  # ---------------- RAG：百炼云知识库 ----------------
-  # 切片、向量、索引、重排都在百炼侧托管，本地不建向量库、不装 Embedding 模型
+  # ---------------- RAG：知识库（两条链路二选一） ----------------
+  # store=bailian（默认）：百炼云知识库。切片、向量、索引、重排都在百炼侧托管，
+  #                        本地不建向量库、不装 Embedding 模型，只需配好 index-name。
+  # store=pgvector       ：本地自建。文档从 /api/knowledge/documents 上传，
+  #                        本地切片、调 DashScope 向量化、存进 PostgreSQL 的 pgvector。
+  # 两条链路产出的都是同一个 Advisor 接口，上层对话代码不用改。
   rag:
-    # 检索服务出问题时的应急开关：关掉后链路退化成纯模型对话，其余功能不受影响
+    # 检索服务出问题时的应急开关：关掉后链路退化成纯模型对话，其余功能不受影响。
+    # store=pgvector 时它还有第二层意义：那条链路在启动期就要连数据库建表/校验，
+    # 数据库连不上会让应用起不来，这时关掉它就是恢复启动的逃生口。
     enabled: true
+    # 用哪一条链路。必须小写：bailian | pgvector。
+    # 写成别的值会在启动期抛绑定异常（不是静默失效），但大小写写错只会让两条链路都不装配，
+    # 表现是「RAG 没了」，所以启动日志里会打出当前生效的是哪一条。
+    store: bailian
     # 百炼控制台里的知识库名称，必须一字不差。
     # 名字写错不会在启动时报错，要等第一次提问才抛 DashScopeException: Index:xxx NotExist
     index-name: 瘦身大师
@@ -166,6 +191,83 @@ purify:
       # 「我想瘦十斤」这种没写明吃/动/药的问题会被 false 跳过，
       # 如果发现这类问题答得不好，改成 true。
       query-all-when-unmatched: false
+
+    # ---------------- 本地向量库（仅 store=pgvector 时生效） ----------------
+    # 连接串里的真实值放 application-local.yml，这个文件是要进仓库的。
+    # 上面的 rerank-min-score / rerank-top-n / enable-reranking 和 router.* 两条链路共用，
+    # 这里只放 pgvector 专有的参数。
+    pgvector:
+      # 连接池大小。知识库读写是低频操作（只有上传和检索两类请求），5 条足够
+      pool-size: 5
+
+      # 表结构。schema/table 只能含字母数字下划线，改完记得和建表脚本对上
+      schema-name: public
+      table-name: rag_knowledge_chunk
+      # 主键类型。用 text 而不是上游默认的 uuid：uuid 会让自动建表额外执行一次
+      # CREATE EXTENSION "uuid-ossp"，阿里云 RDS 的账号未必有建扩展的权限
+      id-type: text
+      # 距离函数，可选 cosine_distance / euclidean_distance / negative_inner_product
+      distance-type: cosine_distance
+      # 向量索引类型，对应流程图里「建立索引」那一步。
+      # hnsw 需要 pgvector >= 0.5.0；低版本改成 ivfflat 或 none
+      index-type: hnsw
+      # 向量维度，必须与 embedding-model 的真实维度一致（v1/v2 是 1536，v3/v4 是 1024）。
+      # 配错不会在启动时报错，而是写第一条数据时才抛 expected N dimensions, not M。
+      # 应用启动时会拿模型名去查内置的已知维度表，对不上直接启动失败
+      dimensions: 1024
+      # 是否让 PgVectorStore 自己建扩展/建表/建索引。
+      # 它会无条件执行 CREATE EXTENSION hstore，RDS 账号没权限的话会让应用起不来，
+      # 那时改成 false 并手工执行 db/pgvector-schema-postgresql.sql
+      initialize-schema: true
+      # 表结构校验。必须保持 false：校验跑在初始化之前，而表不存在时校验是直接抛异常的，
+      # 于是空库上「校验 + 自动建表」这个组合必然启动失败，根本轮不到建表
+      validate-schema: false
+
+      # 向量化。模型名换成 v1/v2 时必须同时把 dimensions 改成 1536
+      embedding-model: text-embedding-v4
+      # document=建索引用，query=检索用。Spring AI 1.0.0 的 SearchRequest 不支持传
+      # 预计算向量，同一个模型实例没法按调用点区分，所以只能全局配一个
+      embedding-text-type: document
+      # 单次 Embedding 请求最多几条切片。DashScope 客户端硬断言 <= 25、
+      # 服务端对 v3/v4 上限是 10，默认的按 token 分批策略一不留神就会超
+      max-documents-per-request: 10
+
+      # 切片。对应流程图里「文档切片」那一步
+      chunk:
+        size: 800
+        min-chunk-size-chars: 350
+        min-chunk-length-to-embed: 5
+        # 超过这个数量的切片会被静默丢弃，所以配小一点让「文档太大」尽早暴露
+        max-num-chunks: 2000
+        keep-separator: true
+
+      # 检索。粗排召回后再交给重排模型精排
+      # 粗排条数不复用 dense-similarity-top-k（100），那个数是百炼接口的上限，
+      # 而这边每一条都要塞进重排请求，太多会让重排很慢
+      coarse-top-k: 20
+      # 0 = 粗排不裁，交给重排的 rerank-min-score 把关
+      similarity-threshold: 0.0
+      # 重排模型名。不复用上面的 rerank-model-name：那个填的是百炼平台侧的名字
+      # （gte-rerank-hybrid），这里是 DashScope 原生重排接口的模型名，两套不通用
+      rerank-model-name: gte-rerank-v2
+
+      # 上传大小上限（字节）。全局 multipart 的 10MB 是按手机照片定的，文本 1MB 足够
+      max-file-size: 1048576
+
+# ==================== 工具用到的第三方服务 ====================
+# 这里只放「该填什么」和空键位，真实密钥一律放 application-local.yml
+# （被 .gitignore 的 *.local.yml 挡住）。配不齐不会影响启动，只是少一个对应的工具，
+# 具体哪些被跳过启动日志里会写——见 ToolConfig 的 agentToolCallbacks。
+aliyun:
+  oss:
+    # PDF 生成工具把文件传到这个 Bucket，再回一个下载链接。
+    # 这两项和 local 里的 access-key-id / access-key-secret 一起构成「配齐」的判定条件
+    endpoint: oss-cn-beijing.aliyuncs.com   # 注意：不带 https://，也不带 bucket 前缀
+    bucket: "big-eventyyds"
+
+searchapi:
+  # 联网搜索工具的 API Key
+  api-key:
 
 logging:
   level:

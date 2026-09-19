@@ -45,6 +45,12 @@
 
     <dependencies>
         <dependency>
+            <groupId>com.itextpdf</groupId>
+            <artifactId>itext-core</artifactId>
+            <version>8.0.5</version>
+            <type>pom</type>
+        </dependency>
+        <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
         </dependency>
@@ -52,6 +58,22 @@
             <groupId>com.alibaba.cloud.ai</groupId>
             <artifactId>spring-ai-alibaba-starter-dashscope</artifactId>
             <version>1.0.0.2</version>
+        </dependency>
+        <dependency>
+            <groupId>cn.hutool</groupId>
+            <artifactId>hutool-all</artifactId>
+            <version>5.8.37</version>
+        </dependency>
+        <!-- jsoup HTML 解析库 -->
+        <dependency>
+            <groupId>org.jsoup</groupId>
+            <artifactId>jsoup</artifactId>
+            <version>1.19.1</version>
+        </dependency>
+        <dependency>
+            <groupId>com.aliyun.oss</groupId>
+            <artifactId>aliyun-sdk-oss</artifactId>
+            <version>3.18.2</version>
         </dependency>
         <dependency>
             <groupId>com.alibaba</groupId>
@@ -70,6 +92,32 @@
         <dependency>
             <groupId>com.mysql</groupId>
             <artifactId>mysql-connector-j</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!--
+            RAG：本地向量库链路（purify.rag.store=pgvector 时才装配）。
+
+            只引 spring-ai-pgvector-store 而不是 spring-ai-starter-vector-store-pgvector：
+            starter 会带上 spring-ai-autoconfigure-vector-store-pgvector，那个自动配置
+            会拿 spring.ai.vectorstore.pgvector.* 去建一个 VectorStore Bean，
+            和本项目「全部手工装配」的做法撞车。这个 jar 不带任何自动配置。
+
+            它自己会传递 spring-jdbc / HikariCP / postgresql 驱动 / pgvector。
+            postgresql 仍然显式声明一次：一是把它降到 runtime（我们只连不编译），
+            二是让「这个项目需要一个 PG 驱动」在 pom 里看得见。
+        -->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-pgvector-store</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-markdown-document-reader</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
             <scope>runtime</scope>
         </dependency>
         <!--
