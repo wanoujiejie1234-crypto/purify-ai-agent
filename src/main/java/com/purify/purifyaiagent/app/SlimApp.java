@@ -4,10 +4,12 @@ import com.alibaba.cloud.ai.dashscope.chat.DashScopeChatOptions;
 import com.purify.purifyaiagent.advisor.LoggingAdvisor;
 import com.purify.purifyaiagent.advisor.ReReadingAdvisor;
 import com.purify.purifyaiagent.advisor.SensitiveWordAdvisor;
+import com.purify.purifyaiagent.chat.ChatRecordRepository;
+import com.purify.purifyaiagent.chat.ChatScene;
 import com.purify.purifyaiagent.config.PromptProperties;
 import com.purify.purifyaiagent.config.RagProperties;
 import com.purify.purifyaiagent.config.VisionProperties;
-import com.purify.purifyaiagent.model.SlimPlan;
+import com.purify.purifyaiagent.model.ChatRecord;
 import com.purify.purifyaiagent.prompt.PromptTemplateLoader;
 import com.purify.purifyaiagent.rag.KnowledgeBaseAdvisor;
 import com.purify.purifyaiagent.tools.UserProfileTool;
@@ -21,6 +23,7 @@ import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.template.NoOpTemplateRenderer;
 import org.springframework.ai.tool.ToolCallbackProvider;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.core.io.Resource;
 import org.springframework.stereotype.Component;
 import org.springframework.util.MimeType;
@@ -29,6 +32,7 @@ import reactor.core.publisher.Flux;
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 
@@ -68,6 +72,12 @@ import java.util.UUID;
  * 不是这里写死的流程；模型要靠 {@link #toolContext} 才知道现在说话的是谁，
  * 那几个入口一个都不能漏，原因见那个方法的注释。
  *
+ * <p><b>聊天记录</b>：每个问答入口在返回前都会往 {@code chat_record} 表写一行（问题 + 答复），
+ * 由 {@link ChatRecordRepository} 落库，和智能体 {@code PurifyManus} 写的是同一张表，
+ * 用 scene 区分是哪条链路。它和上面的对话记忆是两件事：记忆决定模型下一轮看到什么，
+ * 记录是给人查的账本——所以记录写失败不影响对话，也正因为如此，
+ * 每个入口都要显式写这一行，靠不了 Advisor 自动完成。
+ *
  * <p><b>多模态</b>：{@link #explainImage} 走的是另一个 ChatClient（同一个 ChatModel，
  * 但换成 VL 模型名），Advisor 链与文本对话完全一致——也就是说看图同样有记忆、
  * 有敏感词拦截、有日志、也会去查一次知识库。
@@ -100,6 +110,7 @@ public class SlimApp {
     private final ChatClient chatClient;
     private final ChatClient visionChatClient;
     private final ChatMemory chatMemory;
+    private final ChatRecordRepository chatRecordRepository;
     private final PromptTemplateLoader promptTemplateLoader;
     private final PromptProperties promptProperties;
 
@@ -109,14 +120,20 @@ public class SlimApp {
                    ReReadingAdvisor reReadingAdvisor,
                    LoggingAdvisor loggingAdvisor,
                    ObjectProvider<KnowledgeBaseAdvisor> knowledgeBaseAdvisor,
-                   ToolCallbackProvider agentTools,
+                   // 显式点名要哪一个，而不是「按类型拿唯一那个」：
+                   // MCP 的自动配置也会产出同类型的 Bean，靠"恰好只有一个候选"来保证不出错太脆
+                   // （IDEA 就会因此报红）。点名之后拿不到会直接报「没有这个 Bean」，指向明确。
+                   // 那份自动配置当前是关着的，见 application.yml 的 mcp.client.toolcallback.enabled
+                   @Qualifier("agentToolCallbacks") ToolCallbackProvider agentTools,
                    PromptTemplateLoader promptTemplateLoader,
                    PromptProperties promptProperties,
                    VisionProperties visionProperties,
-                   RagProperties ragProperties) {
+                   RagProperties ragProperties,
+                   ChatRecordRepository chatRecordRepository) {
         this.chatMemory = chatMemory;
         this.promptTemplateLoader = promptTemplateLoader;
         this.promptProperties = promptProperties;
+        this.chatRecordRepository = chatRecordRepository;
 
         // 两个 ChatClient 共用同一条 Advisor 链：Advisor 本身无状态，可以安全复用。
         // 这里的书写顺序不影响执行顺序，真正决定先后的是各自的 order，ChatClient 会升序排。
@@ -160,11 +177,15 @@ public class SlimApp {
                         .build())
                 .build();
 
-        // 启动日志打的是「实际有没有装上」，而不是「配置里写了什么」——这两者会不一致：
-        // purify.rag.store 大小写写错（比如 PGVECTOR）时两个配置类都不装配、Advisor 根本不存在，
-        // 但配置值读出来仍是 PGVECTOR。只念配置的话，日志会理直气壮地说「知识库=PGVECTOR」，
-        // 而对话其实一个字都没查过知识库。
-        String ragState = ragAdvisor == null ? "未接入" : "已接入/" + ragProperties.getStore();
+        // 启动日志打的是「实际有没有装上」，而不是「配置里写了什么」——这两者可能不一致。
+        // （曾经举的例子是「store 大小写写错会导致都不装配」，那个说法是错的：
+        //   条件的 havingValue 比较不区分大小写，大写也照样能装配。但「实际状态与配置值
+        //   可能不一致」这件事本身仍然成立，所以这条日志照样念实际状态而不是配置值。）
+        // 枚举名是全大写的（PGVECTOR），直接打出来和 yml 里写的 pgvector 对不上，
+        // 排查时容易让人怀疑是不是读到了别的值，所以统一转成小写再打
+        String ragState = ragAdvisor == null
+                ? "未接入"
+                : "已接入/" + ragProperties.getStore().name().toLowerCase(Locale.ROOT);
         log.info("[SlimApp] 初始化完成：对话记忆 + 敏感词拦截 + Re-Reading + 日志{}，共 {} 个 Advisor；"
                         + "工具 {} 个；看图模型={}；知识库={}",
                 ragAdvisor == null ? "" : " + 知识库检索(RAG)",
@@ -173,13 +194,18 @@ public class SlimApp {
                 visionProperties.getModel(),
                 ragState);
 
-        // 开着 RAG 却一个 Advisor 都没有，只可能是配置写错了（enabled=true 且 store 合法时，
-        // 两个配置类必有一个生效）。这时对话会静默退化成纯模型闲聊，不说一声很难发现。
-        // 不直接启动失败，是为了保住 purify.rag.enabled 这条应急降级路径
+        // 开着 RAG 却一个 Advisor 都没有，说明装配层出了问题（store 的取值合法时，
+        // bailian / pgvector 两种都会装配出恰好一个 Advisor）。这时对话会静默退化
+        // 成纯模型闲聊，不说一声很难发现。不直接启动失败，是为了保住
+        // purify.rag.enabled 这条应急降级路径。
+        //
+        // 注意这条 WARN 的实际可达性很低：store 写了不认识的枚举值会在绑定期就抛异常，
+        // 根本走不到这里。它更像是装配条件被改坏时的一道兜底，留着不碍事
         if (ragProperties.isEnabled() && ragAdvisor == null) {
             log.warn("[SlimApp] purify.rag.enabled=true 但知识库检索 Advisor 没有装配上："
-                    + "对话不会查任何知识库。多半是 purify.rag.store 的值不合法（必须是全小写的 "
-                    + "bailian 或 pgvector），当前读到的是「{}」", ragProperties.getStore());
+                    + "对话不会查任何知识库。请检查 purify.rag.store 的取值"
+                    + "（bailian 或 pgvector）以及各 RAG 配置类的装配条件，当前读到的是「{}」",
+                    ragProperties.getStore());
         }
     }
 
@@ -191,44 +217,41 @@ public class SlimApp {
     /**
      * 多轮对话（阻塞式）。
      *
+     * <p><b>它没有对应的 HTTP 入口</b>：接口层走的是 {@link #chatStream} 那条（理由见
+     * {@code SlimAppController}——EventSource 自动重连会把同一句话再问一遍）。
+     * 这个方法留给不走 HTTP 的调用方和测试。
+     *
      * @param message 用户输入
      * @param chatId  会话 ID，相同 ID 共享历史记录
      */
     public String chat(String message, String chatId) {
-        return chatClient.prompt()
+        String reply = chatClient.prompt()
                 .system(renderSystemPrompt())
                 .user(message)
                 .advisors(spec -> spec.param(ChatMemory.CONVERSATION_ID, chatId))
                 .toolContext(toolContext(chatId))
                 .call()
                 .content();
+        record(chatId, ChatScene.SLIM, message, reply);
+        return reply;
     }
 
     /** 多轮对话（流式），返回逐段生成的文本。 */
     public Flux<String> chatStream(String message, String chatId) {
+        // 流式拿不到一个「最终的字符串」，只能自己把分片攒起来；
+        // 攒的动作和 LoggingAdvisor 汇总日志是同一个套路
+        StringBuilder reply = new StringBuilder();
         return chatClient.prompt()
                 .system(renderSystemPrompt())
                 .user(message)
                 .advisors(spec -> spec.param(ChatMemory.CONVERSATION_ID, chatId))
                 .toolContext(toolContext(chatId))
                 .stream()
-                .content();
-    }
-
-    /**
-     * 根据当前会话的历史，生成一份结构化的瘦身计划。
-     *
-     * <p>与 {@link #chat} 走同一条 Advisor 链，区别只是用 {@code entity} 让模型返回 JSON，
-     * 说明 Advisor 对「文本输出」和「结构化输出」都生效。
-     */
-    public SlimPlan generatePlan(String message, String chatId) {
-        return chatClient.prompt()
-                .system(renderSystemPrompt())
-                .user(message)
-                .advisors(spec -> spec.param(ChatMemory.CONVERSATION_ID, chatId))
-                .toolContext(toolContext(chatId))
-                .call()
-                .entity(SlimPlan.class);
+                .content()
+                .doOnNext(reply::append)
+                // 只在流正常结束时记一笔。中途断了说明用户没拿到完整答复，
+                // 记一条残缺的答案进库，比不记更容易误导后来看记录的人
+                .doOnComplete(() -> record(chatId, ChatScene.SLIM, message, reply.toString()));
     }
 
     /**
@@ -251,13 +274,17 @@ public class SlimApp {
         String ask = (question == null || question.isBlank()) ? DEFAULT_IMAGE_QUESTION : question;
         String userText = promptTemplateLoader.render(IMAGE_EXPLAIN_TEMPLATE, Map.of("question", ask));
 
-        return visionChatClient.prompt()
+        String reply = visionChatClient.prompt()
                 .system(promptTemplateLoader.render(VISION_SYSTEM_TEMPLATE, Map.of()))
                 .user(spec -> spec.text(userText).media(mimeType, image))
                 .advisors(spec -> spec.param(ChatMemory.CONVERSATION_ID, chatId))
                 .toolContext(toolContext(chatId))
                 .call()
                 .content();
+        // 记的是 ask（用户没提问时那句默认问题），不是模板渲染后的正文——
+        // 记录要能直接反映用户说了什么，模板细节不该漏进去
+        record(chatId, ChatScene.SLIM_IMAGE, ask, reply);
+        return reply;
     }
 
     /** 读取某个会话的完整历史（来自 MySQL）。 */
@@ -268,6 +295,19 @@ public class SlimApp {
     /** 清空某个会话的历史。 */
     public void clearHistory(String chatId) {
         chatMemory.clear(chatId);
+    }
+
+    /**
+     * 把这一轮问答记进 {@code chat_record} 表。
+     *
+     * <p>记在应用层而不是 controller：入口不止 HTTP 一个（测试、将来可能的定时任务都是直接调这里），
+     * 而记录应该跟着「这次对话真的发生了」走，不是跟着「有没有走 HTTP」走。
+     *
+     * <p>写库失败不往外抛（{@link ChatRecordRepository#save} 自己兜住了），
+     * 所以这里不用再兜一层异常，也不用担心它把一次已经答完的对话变成失败。
+     */
+    private void record(String chatId, ChatScene scene, String question, String answer) {
+        chatRecordRepository.save(ChatRecord.slim(chatId, scene, question, answer));
     }
     /**
      * 渲染系统提示词。

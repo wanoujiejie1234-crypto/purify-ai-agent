@@ -44,9 +44,16 @@ import org.springframework.jdbc.core.JdbcTemplate;
  *                 └── PgVectorStore / DashScopeRerankModel
  * </pre>
  *
- * <p><b>只有 {@code purify.rag.store=pgvector} 时本类才装配</b>，所以默认配置下
- * 容器里的一切与加这条链路之前完全一样。两个条件都写在类上——
- * {@code @ConditionalOnProperty} 在 Spring Boot 3.5 是可重复标注的。
+ * <p><b>装配条件</b>：{@code purify.rag.enabled} 且 {@code purify.rag.store} 是
+ * {@link RagStore#PGVECTOR}。整个类一起装配、一起不装配——本类产出的向量库、检索器、
+ * Advisor 和上传服务都属于这一条链路，没有需要单独取舍的部分。
+ *
+ * <p>这里<b>没有</b> {@code matchIfMissing}，不能加：不写 store 时默认走百炼，
+ * 不该把本地向量库也一起拉起来。
+ *
+ * <p>注意 {@code KnowledgeBaseController} 也带着同样的类级条件，两边的口径必须一致，
+ * 否则会出现「Bean 在但上传接口 404」这种自相矛盾的状态。两边都引用 {@link RagStore}
+ * 里的常量，就是为了让这个一致性由编译器保证，而不是靠人记着。
  *
  * <h2>为什么 PostgreSQL 的连接池不做成 Bean</h2>
  *
@@ -76,7 +83,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 @Slf4j
 @Configuration
 @ConditionalOnProperty(prefix = "purify.rag", name = "enabled", havingValue = "true", matchIfMissing = true)
-@ConditionalOnProperty(prefix = "purify.rag", name = "store", havingValue = "pgvector")
+@ConditionalOnProperty(prefix = RagStore.PREFIX, name = "store", havingValue = RagStore.PGVECTOR)
 public class PgVectorRagConfig {
 
     /**
@@ -228,11 +235,10 @@ public class PgVectorRagConfig {
     /**
      * 检索 Advisor。行为与百炼那条链路的 Advisor 对齐。
      *
-     * <p><b>Bean 名与百炼链路刻意一致</b>（{@code knowledgeBaseRetrievalAdvisor}）：
-     * 两条链路互斥，正常只会存在一个；万一条件写错导致两个同时命中，
-     * Boot 默认禁止 Bean 定义覆盖，会在启动期直接抛
-     * {@code BeanDefinitionOverrideException}，比留到注入阶段报含糊的
-     * {@code NoUniqueBeanDefinitionException} 好定位得多。
+     * <p><b>Bean 名与百炼链路刻意一致</b>（{@code knowledgeBaseRetrievalAdvisor}）。
+     * 两条链路的装配条件在类级就是互斥的（store 不可能同时等于 pgvector 和 bailian），
+     * 所以容器里永远只有一个，{@code SlimApp} 按 {@link KnowledgeBaseAdvisor} 类型取
+     * 也就不会撞上 {@code NoUniqueBeanDefinitionException}。
      */
     @Bean
     public KnowledgeBaseAdvisor knowledgeBaseRetrievalAdvisor(DocumentRetriever pgVectorDocumentRetriever,
@@ -240,10 +246,10 @@ public class PgVectorRagConfig {
                                                              KnowledgeRouter knowledgeRouter) {
         if (ragProperties.isEnableReference()) {
             // 引用标注的实现绑在百炼官方的 Advisor 父类上，本地链路没有这一步。
-            // 与其让用户以为开着，不如说清楚
+            // 与其让用户以为开着，不如说清楚。
             log.warn("[pgvector] purify.rag.enable-reference=true 在本地向量库链路上不生效："
                     + "引用标注由百炼官方的 Advisor 实现，本地链路没有对应实现。"
-                    + "需要引用标注请把 purify.rag.store 改回 bailian");
+                    + "需要引用标注请把 purify.rag.store 改成 bailian");
         }
 
         return new PgVectorKnowledgeBaseAdvisor(pgVectorDocumentRetriever,

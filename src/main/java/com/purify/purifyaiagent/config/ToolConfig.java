@@ -1,24 +1,23 @@
 package com.purify.purifyaiagent.config;
 
 import com.purify.purifyaiagent.profile.UserProfileRepository;
+import com.purify.purifyaiagent.tools.AgentToolRegistry;
 import com.purify.purifyaiagent.tools.FileOperationTool;
 import com.purify.purifyaiagent.tools.PDFGenerationTool;
 import com.purify.purifyaiagent.tools.ResourceDownloadTool;
 import com.purify.purifyaiagent.tools.UserProfileTool;
 import com.purify.purifyaiagent.tools.WebScrapingTool;
 import com.purify.purifyaiagent.tools.WebSearchTool;
+import io.modelcontextprotocol.client.McpSyncClient;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.ai.support.ToolCallbacks;
-import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.ToolCallbackProvider;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.jdbc.core.JdbcTemplate;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
-import java.util.stream.Collectors;
 
 /**
  * 工具的统一注册处。
@@ -29,12 +28,20 @@ import java.util.stream.Collectors;
  *
  * <p><b>唯一的出口是 {@link #agentToolCallbacks}。</b>{@code SlimApp} 只依赖它，
  * 不直接引用任何一个具体的工具类，所以增删工具不需要改对话代码。
+ * 出口也确实只能有一个：容器里出现第二个 {@code ToolCallbackProvider} 时，
+ * {@code SlimApp} 那句按类型的注入会变成「两个候选」，启动直接失败。
+ * 所以 {@code spring.ai.mcp.client.toolcallback.enabled} 配成了 false，
+ * 关掉自动配置那个同类型的 Bean，MCP 工具改由 {@link AgentToolRegistry} 合并进这里。
  *
  * <p><b>需要外部配置、又没配的工具不会被注册。</b>比如没填 {@code searchapi.api-key} 就没有联网搜索。
  * 这样做的理由：注册一个每次调用都只会报「没配置」的工具，比没有这个工具更糟——
  * 模型会看到它、会去调它、会拿回一句报错，最后把这段报错转述给用户。
  * 少一个工具则没有任何副作用，模型本来就会用别的方式回答。
  * 启动日志里会把最终注册了哪些工具、哪些因为没配置被跳过，都打出来。
+ *
+ * <p><b>MCP 工具（高德地图）不在这个类的判断范围内。</b>server 清单在 {@code mcp-servers.json}，
+ * 有哪个 server、每个 server 提供哪些工具都是运行期才知道的，所以这部分统一交给
+ * {@link AgentToolRegistry}：它负责连接、取工具、查重名、打日志，连不上就只丢 MCP 那部分。
  */
 @Slf4j
 @Configuration
@@ -93,6 +100,14 @@ public class ToolConfig {
      * 的语义撞车（到底注入的是我声明的那一个，还是容器收集出来的一堆），
      * 换成一个语义明确的类型就没有这层歧义。ChatClient 的
      * {@code defaultToolCallbacks(ToolCallbackProvider...)} 正好收它。
+     *
+     * <p>这个方法只决定「哪些本地工具够格」，够格的交给 {@link AgentToolRegistry} 去汇编——
+     * MCP 工具在那里合并进来，重名校验和注册日志也在那里，这里不再重复打一遍。
+     *
+     * @param mcpClients MCP 客户端，由 Spring AI 的自动配置按 {@code mcp-servers.json} 建好。
+     *                   用 {@code ObjectProvider} 取是因为它可能压根不存在
+     *                   （{@code spring.ai.mcp.client.enabled=false} 时整个 MCP 自动配置都不生效），
+     *                   直接注入会让「关掉 MCP」变成启动失败。
      */
     @Bean
     public ToolCallbackProvider agentToolCallbacks(
@@ -102,7 +117,8 @@ public class ToolConfig {
             ResourceDownloadTool resourceDownloadTool,
             PDFGenerationTool pdfGenerationTool,
             SearchApiProperties searchApiProperties,
-            AliyunOssProperties aliyunOssProperties) {
+            AliyunOssProperties aliyunOssProperties,
+            ObjectProvider<List<McpSyncClient>> mcpClients) {
 
         List<Object> tools = new ArrayList<>(List.of(
                 userProfileTool,
@@ -124,17 +140,7 @@ public class ToolConfig {
             log.warn("[ToolConfig] 未注册「联网搜索」：没有配置 searchapi.api-key");
         }
 
-        // from(Object...) 会扫一遍每个对象上的 @Tool 方法并生成 JSON Schema，
-        // 顺便校验工具名有没有重名（重了会直接抛异常，不会静默丢一个）
-        ToolCallback[] callbacks = ToolCallbacks.from(tools.toArray());
-        log.info("[ToolConfig] 已注册 {} 个工具：{}", callbacks.length, namesOf(callbacks));
-        return ToolCallbackProvider.from(callbacks);
-    }
-
-    /** 启动日志里打工具名，方便一眼看出模型到底能调哪些。 */
-    private static String namesOf(ToolCallback[] callbacks) {
-        return Arrays.stream(callbacks)
-                .map(callback -> callback.getToolDefinition().name())
-                .collect(Collectors.joining(", "));
+        AgentToolRegistry registry = new AgentToolRegistry(tools, mcpClients.getIfAvailable(List::of));
+        return ToolCallbackProvider.from(registry.callbacks());
     }
 }

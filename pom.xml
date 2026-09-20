@@ -44,6 +44,22 @@
     </dependencyManagement>
 
     <dependencies>
+        <!--
+            MCP 客户端：连外部工具服务器（高德地图），把它们提供的工具交给模型。
+
+            必须是这个名字、也必须不写版本号。M6 时代它叫 spring-ai-mcp-client-spring-boot-starter，
+            GA 改名成了 spring-ai-starter-mcp-client；两个版本的 MCP 产物和 1.0.0 的
+            ToolCallback / ToolCallbackProvider 对不上，混着用会在运行期炸出来。
+            版本由上面的 spring-ai-bom 统一管（1.0.0），这里再写一遍只会写歪。
+
+            不带 -webflux 后缀：那个变体是给 SSE/HTTP 传输用的，本项目用的是 stdio
+            （本地起一个 npx 进程），它会把整个 WebFlux 拉进来，和 spring-boot-starter-web 并存没必要。
+        -->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-starter-mcp-client</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>com.itextpdf</groupId>
             <artifactId>itext-core</artifactId>
@@ -74,11 +90,6 @@
             <groupId>com.aliyun.oss</groupId>
             <artifactId>aliyun-sdk-oss</artifactId>
             <version>3.18.2</version>
-        </dependency>
-        <dependency>
-            <groupId>com.alibaba</groupId>
-            <artifactId>dashscope-sdk-java</artifactId>
-            <version>2.20.3</version>
         </dependency>
         <!-- 对话记忆持久化：JDBC 仓储 + 数据源 -->
         <dependency>
@@ -121,10 +132,15 @@
             <scope>runtime</scope>
         </dependency>
         <!--
-            结构化输出（ChatClient...entity(Class)）依赖的 JSON Schema 生成器。
-            Spring AI 1.0.0 把它声明为可选依赖，不会传递进来，
-            不显式引入的话运行时才抛 NoClassDefFoundError: ...jsonschema.generator.AnnotationHelper。
-            版本与 spring-ai-model:1.0.0 内部使用的一致。
+            JSON Schema 生成器。凡是需要「给模型描述一个 Java 类型的结构」的地方都要它，
+            最典型的两个用途：每个 @Tool 方法的入参 schema（ToolDefinitions 会为
+            FileOperationTool、PDFGenerationTool 等全部工具生成），以及
+            ChatClient...entity(Class) 这类结构化输出。
+
+            虽然 spring-ai-model:1.0.0 自己就带了这两个依赖（compile scope、非 optional），
+            但仍显式声明一份：一来把版本钉死在 4.37.0，避免某个间接依赖把版本顶掉之后
+            运行期才抛 NoClassDefFoundError: ...jsonschema.generator.AnnotationHelper；
+            二来让「这个项目依赖 JSON Schema 生成」在 pom 里看得见。
         -->
         <dependency>
             <groupId>com.github.victools</groupId>
@@ -153,6 +169,22 @@
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+            <!--
+                默认只跑纯单元测试。
+
+                带 @Tag("integration") 的那批会真的调 DashScope 模型、连远程 MySQL/PostgreSQL
+                （43.142.91.248），整套跑下来 ~100 秒，占全部测试耗时的 93%。
+                其中 CloudKnowledgeMigrationTest 还会往共享的远程库写入数据。
+
+                需要时显式跑：mvnw test -Dgroups=integration
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <excludedGroups>integration</excludedGroups>
+                </configuration>
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>

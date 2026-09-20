@@ -1,0 +1,87 @@
+:root {
+  /* 两条链路的主题色。主页卡片、聊天页气泡都从这里取，保证同一条链路颜色一致 */
+  --slim: #10a37f;
+  --manus: #6366f1;
+
+  --ink: #14161a;
+  --page: #f6f7f9;
+  --line: #e6e8ec;
+
+  --font: system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', 'Noto Sans SC', sans-serif;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font);
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--ink);
+  background: var(--page);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+/* 键盘 Tab 到时给一个清晰的焦点圈；鼠标点击时不显示，避免每一处都描一圈 */
+:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+
+/* 滚动条做细一点，别抢视觉 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(128, 138, 158, 0.35) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(128, 138, 158, 0.32);
+  border-radius: 999px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/*
+ * 尊重系统的「减弱动态效果」设置。
+ * delay 也要一并清零：入场动画用的是 animation-fill-mode: backwards，
+ * 只把 duration 压到 0 而留着 delay 的话，元素会先隐身几百毫秒再闪现，反而更难受。
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

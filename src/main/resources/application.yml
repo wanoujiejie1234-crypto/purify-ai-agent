@@ -22,7 +22,15 @@ spring:
   sql:
     init:
       mode: always
-      schema-locations: classpath:db/user-profile-schema-mysql.sql
+      # 每个脚本里每条语句都带 IF NOT EXISTS，重复启动不会报错，也不会清掉已有数据
+      schema-locations:
+        - classpath:db/user-profile-schema-mysql.sql
+        # 聊天记录表。注意它和对话记忆表（SPRING_AI_CHAT_MEMORY，由 Spring AI 自己建）不是一回事：
+        # 那个是喂给模型的记忆，这个是给人查的记录，分工写在脚本注释里
+        - classpath:db/chat-record-schema-mysql.sql
+        # 会话表（侧边栏的每一项）。它和上面那张的分工也写在脚本注释里：
+        # 那个存「一轮问答」，这个存「一个会话」——谁、叫什么名字、什么时候聊的
+        - classpath:db/chat-session-schema-mysql.sql
 
   ai:
     # ---------------- 对话记忆：官方 JdbcChatMemoryRepository ----------------
@@ -34,6 +42,40 @@ spring:
             initialize-schema: always
             # 官方 jar 内没有 schema-mysql.sql，这里指向自带脚本，见 db/chat-memory-schema-mysql.sql
             schema: classpath:db/chat-memory-schema-mysql.sql
+    # ---------------- MCP：把外部工具服务器接到模型上 ----------------
+    # 高德地图那套工具（天气、地理编码、路线规划、周边搜索……）由 MCP server 提供，
+    # server 清单在 mcp-servers.json 里——那是 Claude Desktop 的格式，Spring AI 直接读。
+    # 挂上之后这些工具和本地工具对模型是同一种东西，调不调、调哪个由模型自己决定。
+    #
+    # 这一段放在这里而不是 application-local.yml：里面没有密钥，而「换个机器要改哪里」
+    # 应该一眼看得见。（application-local.yml 里那几行同名的配置是当初调通时留下的，值一样，
+    # 删掉即可——留着也不会错，只是以后改这个文件会不生效，因为 profile 的优先级更高。）
+    mcp:
+      client:
+        # 握手时告诉 server 的客户端名字，会出现在 server 自己的日志里，换个好认的
+        name: purify-ai-agent
+        # 默认 20s 对外部服务偏紧：高德的路线规划偶尔要想几秒，npx 冷启动（要下包）更慢
+        request-timeout: 60s
+        # 故意配成 false，不是一个可以随手改回去的默认值：
+        #   true  → 握手发生在 Bean 创建时，npx 没装 / 包拉不下来 / 网络不通都会直接抛异常，
+        #           整个应用起不来——为了一个地图工具搭上整个服务，不划算；
+        #   false → 握手挪到 AgentToolRegistry 里做，连不上就只丢 MCP 那部分工具，
+        #           本地工具照常用，应用照常启动，日志里留一条 warn 说明原因。
+        initialized: false
+        stdio:
+          # server 清单在 mcp-servers.json 里（Claude Desktop 的格式，Spring AI 直接读）。
+          # 注意那个文件里还带着 AMAP_MAPS_API_KEY，而 *.local.yml 那套 .gitignore 规则挡不住它——
+          # 这个 Key 已经进了仓库，要么去高德控制台重新生成一个，要么把配置整体挪成下面的写法：
+          #   stdio.connections.amap-maps.command/args 写在这里，
+          #   stdio.connections.amap-maps.env.AMAP_MAPS_API_KEY 写进 application-local.yml。
+          # （同名时 connections 会整个覆盖 json 里的那条，所以两处不能各写一半。）
+          servers-configuration: classpath:mcp-servers.json
+        toolcallback:
+          # 关掉自动配置的那个 ToolCallbackProvider Bean。项目里的工具出口只能有一个
+          # （ToolConfig#agentToolCallbacks），多一个同类型的 Bean 会让 SlimApp 那句按类型的注入
+          # 变成「两个候选」，启动直接失败。MCP 工具由 AgentToolRegistry 合并进那唯一的一个出口。
+          enabled: false
+
     # ---------------- 通义千问 DashScope ----------------
     dashscope:
       chat:
@@ -71,6 +113,32 @@ purify:
     # slim-app-system.st 里 {nickname} 的取值
     nickname: 朋友
 
+  # ---------------- PurifyManus：自己驱动循环的 ReAct 智能体 ----------------
+  # 和上面的 slim 应用并列的一条链路（/api/manus/*），互不影响：
+  # slim 是「一问一答」，工具由框架内置的循环执行，应用层看不见中间过程；
+  # manus 自己驱动 think → act 循环，每一步都能观测，也因此能在原地打转时介入。
+  # 这些值都有默认值，不写也能跑，列在这里是为了让「怎么调」一眼看得见。
+  manus:
+    # 一次任务最多走几步。这是循环检测之外的最后一道闸，不是主要手段：
+    # 正常情况下应该由「模型答完」或者看门狗先收尾
+    max-steps: 12
+    # 每个会话记住多少条消息。一次工具调用占两条（模型说要调、工具回结果），按整轮裁剪
+    memory-window: 40
+    # 循环检测的阈值。定太松，模型多绕两步才被发现；定太紧，正常的「重试一次」也会被当卡住
+    loop:
+      # 连续几步调用同一组工具、参数完全相同，才算在重复
+      repeat-threshold: 3
+      # A/B 来回横跳几轮才算。2 轮 = 4 步（A、B、A、B）。
+      # 比 repeat-threshold 小是有意的：横跳时每一步单看都在「换做法」，等它重复三轮就太晚了
+      alternate-threshold: 2
+      # 连续几步说的话一模一样才算重复（工具在换、说法没换，其实没进展）
+      answer-threshold: 3
+      # 重复到这个次数，处置从「提醒模型换策略」升级为「停下来问用户」。
+      # 必须小于下面的 abort-after，否则中间这一档永远不会被问到
+      ask-user-after: 5
+      # 重复到这个次数就直接中止，把情况说清楚，好过继续烧 token
+      abort-after: 7
+
   # ---------------- 多模态（看图） ----------------
   vision:
     # 文本模型 qwen-plus 不读图，图片必须交给 VL 系列模型
@@ -78,21 +146,29 @@ purify:
     # 体检单、运动记录截图这类小字图需要高分辨率，普通照片可以关掉省 token
     high-resolution-images: true
 
-  # ---------------- RAG：知识库（两条链路二选一） ----------------
-  # store=bailian（默认）：百炼云知识库。切片、向量、索引、重排都在百炼侧托管，
+  # ---------------- RAG：知识库 ----------------
+  # 当前生效：store=pgvector —— 只读云服务器上的 pgvector，百炼云知识库不再参与检索。
+  # 百炼那边的链路（RagConfig）整套原样保留，改回 bailian 就能整体切回去，不用改一行代码。
+  #
+  # store=pgvector       ：只用 pgvector。文档从 /api/knowledge/documents 上传，
+  #                        切片、调 DashScope 向量化、存进 PostgreSQL 的 pgvector。
+  # store=bailian        ：只用百炼云知识库。切片、向量、索引、重排都在百炼侧托管，
   #                        本地不建向量库、不装 Embedding 模型，只需配好 index-name。
-  # store=pgvector       ：本地自建。文档从 /api/knowledge/documents 上传，
-  #                        本地切片、调 DashScope 向量化、存进 PostgreSQL 的 pgvector。
-  # 两条链路产出的都是同一个 Advisor 接口，上层对话代码不用改。
+  # 两条链路产出的都是同一个 Advisor 接口，上层对话代码不用改；但两者只能选一。
+  #
+  # 注意：store=pgvector 时 index-name 那几项不会被读取（它们只服务百炼链路），
+  # 留着是为了切回去时不用再翻控制台。百炼云知识库的内容可以在
+  # CloudKnowledgeMigrationTest 里一次性搬到 pgvector，之后就不再需要它了。
   rag:
     # 检索服务出问题时的应急开关：关掉后链路退化成纯模型对话，其余功能不受影响。
-    # store=pgvector 时它还有第二层意义：那条链路在启动期就要连数据库建表/校验，
-    # 数据库连不上会让应用起不来，这时关掉它就是恢复启动的逃生口。
+    # store=pgvector 时它还有第二层意义：那条链路在启动期就要连数据库
+    # 建连接池、建表、建扩展，数据库连不上会让应用起不来，这时关掉它就是恢复启动的逃生口。
     enabled: true
-    # 用哪一条链路。必须小写：bailian | pgvector。
-    # 写成别的值会在启动期抛绑定异常（不是静默失效），但大小写写错只会让两条链路都不装配，
-    # 表现是「RAG 没了」，所以启动日志里会打出当前生效的是哪一条。
-    store: bailian
+    # 走哪一条链路：bailian | pgvector（大小写不敏感，PGVECTOR 也一样）。
+    # 写成别的值（比如 pgvectr）会在启动期抛绑定异常，而不是静默失效。
+    # 换句话说 RAG 要么正常工作、要么起不来，不存在「悄悄不查知识库」这种中间状态。
+    # 当前只读 pgvector：百炼那条链路整个不装配，检索不会再发远程请求。
+    store: pgvector
     # 百炼控制台里的知识库名称，必须一字不差。
     # 名字写错不会在启动时报错，要等第一次提问才抛 DashScopeException: Index:xxx NotExist
     index-name: 瘦身大师
@@ -194,7 +270,7 @@ purify:
 
     # ---------------- 本地向量库（仅 store=pgvector 时生效） ----------------
     # 连接串里的真实值放 application-local.yml，这个文件是要进仓库的。
-    # 上面的 rerank-min-score / rerank-top-n / enable-reranking 和 router.* 两条链路共用，
+    # 上面的 rerank-min-score / rerank-top-n / enable-reranking 和 router.* 各条链路共用，
     # 这里只放 pgvector 专有的参数。
     pgvector:
       # 连接池大小。知识库读写是低频操作（只有上传和检索两类请求），5 条足够

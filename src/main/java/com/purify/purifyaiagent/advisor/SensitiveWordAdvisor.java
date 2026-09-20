@@ -8,14 +8,7 @@ import org.springframework.ai.chat.client.advisor.api.CallAdvisor;
 import org.springframework.ai.chat.client.advisor.api.CallAdvisorChain;
 import org.springframework.ai.chat.client.advisor.api.StreamAdvisor;
 import org.springframework.ai.chat.client.advisor.api.StreamAdvisorChain;
-import org.springframework.ai.chat.messages.Message;
-import org.springframework.ai.chat.messages.UserMessage;
 import reactor.core.publisher.Flux;
-
-import java.util.Collection;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Set;
 
 /**
  * 敏感词拦截 Advisor：命中敏感词时直接抛出异常，不再调用模型。
@@ -31,64 +24,47 @@ import java.util.Set;
 @Slf4j
 public class SensitiveWordAdvisor implements CallAdvisor, StreamAdvisor {
 
-    private final Set<String> sensitiveWords;
-    private final String replyMessage;
-    private final boolean enabled;
+    /**
+     * 判据本身。本类只负责「拦下来之后怎么让调用链停下」（抛异常 / {@code Flux.error}），
+     * 词表和话术都在 {@link SensitiveWordChecker} 里——智能体那条链路没有 Advisor，
+     * 也要用同一份判据，所以不能留在本类里。
+     */
+    private final SensitiveWordChecker checker;
+
     private final int order;
 
-    public SensitiveWordAdvisor(Collection<String> sensitiveWords, String replyMessage, boolean enabled) {
-        this(sensitiveWords, replyMessage, enabled, AdvisorOrders.SENSITIVE_WORD);
+    public SensitiveWordAdvisor(SensitiveWordChecker checker) {
+        this(checker, AdvisorOrders.SENSITIVE_WORD);
     }
 
-    public SensitiveWordAdvisor(Collection<String> sensitiveWords, String replyMessage, boolean enabled, int order) {
-        this.sensitiveWords = new LinkedHashSet<>(sensitiveWords == null ? List.of() : sensitiveWords);
-        this.replyMessage = replyMessage;
-        this.enabled = enabled;
+    public SensitiveWordAdvisor(SensitiveWordChecker checker, int order) {
+        this.checker = checker;
         this.order = order;
     }
 
     @Override
     public ChatClientResponse adviseCall(ChatClientRequest request, CallAdvisorChain chain) {
-        String hit = match(lastUserText(request));
+        String hit = checker.match(lastUserText(request));
         if (hit == null) {
             return chain.nextCall(request);
         }
         log.warn("[SensitiveWordAdvisor] 命中敏感词 [{}]，已拦截本次请求，不调用模型", hit);
-        throw new SensitiveWordException(hit, replyMessage);
+        throw new SensitiveWordException(hit, checker.replyMessage());
     }
 
     @Override
     public Flux<ChatClientResponse> adviseStream(ChatClientRequest request, StreamAdvisorChain chain) {
-        String hit = match(lastUserText(request));
+        String hit = checker.match(lastUserText(request));
         if (hit == null) {
             return chain.nextStream(request);
         }
         log.warn("[SensitiveWordAdvisor] 命中敏感词 [{}]，已拦截本次流式请求，不调用模型", hit);
-        return Flux.error(new SensitiveWordException(hit, replyMessage));
+        return Flux.error(new SensitiveWordException(hit, checker.replyMessage()));
     }
 
-    /** 返回命中的敏感词，没有命中返回 null。 */
-    private String match(String text) {
-        if (!enabled || text == null || text.isBlank()) {
-            return null;
-        }
-        for (String word : sensitiveWords) {
-            if (text.contains(word)) {
-                return word;
-            }
-        }
-        return null;
-    }
-
-    /** 取 Prompt 中最后一条用户消息的文本。 */
+    /** 取 Prompt 中最后一条用户消息的文本。扫描范围与智能体那边共用一份实现，见 Checker 的注释。 */
     private static String lastUserText(ChatClientRequest request) {
-        List<Message> instructions = request.prompt().getInstructions();
-        for (int i = instructions.size() - 1; i >= 0; i--) {
-            if (instructions.get(i) instanceof UserMessage userMessage) {
-                return userMessage.getText();
-            }
-        }
-        return null;
+        return SensitiveWordChecker.lastUserText(request.prompt().getInstructions());
     }
 
     @Override

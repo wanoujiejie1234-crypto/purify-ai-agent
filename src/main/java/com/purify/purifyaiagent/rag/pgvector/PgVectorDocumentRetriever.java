@@ -20,6 +20,7 @@ import org.springframework.util.CollectionUtils;
 
 import java.util.Comparator;
 import java.util.List;
+import java.util.stream.Collectors;
 
 /**
  * 本地 pgvector 检索器 —— 流程图右半边「文档过滤和检索」那一段。
@@ -41,6 +42,15 @@ import java.util.List;
  */
 @Slf4j
 public class PgVectorDocumentRetriever implements DocumentRetriever {
+
+    /**
+     * 重排分数写进切片元数据用的键。
+     *
+     * <p>只在自检接口和日志里用，不参与提示词拼装（{@code DOCUMENT_FORMATTER} 不读它）。
+     * 存在的理由：调 {@code rerank-min-score} 时最想知道「被丢掉的那几条差多少分」，
+     * 而分数原本在过滤那一步之后就被扔了。
+     */
+    public static final String META_SCORE = "rerank_score";
 
     private final VectorStore vectorStore;
 
@@ -85,14 +95,28 @@ public class PgVectorDocumentRetriever implements DocumentRetriever {
             searchRequest.filterExpression(filter);
         }
 
+        long searchStart = System.currentTimeMillis();
         List<Document> candidates = vectorStore.similaritySearch(searchRequest.build());
+        long searchMs = System.currentTimeMillis() - searchStart;
+
         if (CollectionUtils.isEmpty(candidates)) {
-            log.debug("[pgvector] 粗排没召回任何切片：{}", query.text());
+            // 打 INFO 而不是 DEBUG：「知识库好像没工作」最常见的原因就是表里没东西或
+            // 过滤条件把结果全筛掉了，而 DEBUG 在生产默认不输出——日志里一片安静，
+            // 看起来和「压根没查」一模一样，这正是排查时最想分清的两种情形
+            log.info("[pgvector] 粗排没召回任何切片（耗时 {}ms，分类过滤 {}）：{}",
+                    searchMs, filter == null ? "无" : "有", query.text());
             return List.of();
         }
 
+        long rerankStart = System.currentTimeMillis();
         List<Document> reranked = rerank(query.text(), candidates);
-        log.debug("[pgvector] 粗排 {} 条 → 精排 {} 条：{}", candidates.size(), reranked.size(), query.text());
+
+        // 一次一行，把两段耗时分开报：粗排是本地的向量检索、精排是一次远程模型调用，
+        // 「检索很慢」时先怀疑哪一段，看这一行就够了
+        log.info("[pgvector] 粗排 {} 条（{}ms）→ 精排 {} 条（{}ms）：{}",
+                candidates.size(), searchMs,
+                reranked.size(), System.currentTimeMillis() - rerankStart,
+                query.text());
         return reranked;
     }
 
@@ -155,12 +179,44 @@ public class PgVectorDocumentRetriever implements DocumentRetriever {
                 .sorted(Comparator.comparingDouble(DocumentWithScore::getScore).reversed())
                 .limit(topN)
                 // 重排返回的是原始 Document 对象（按序号回查输入列表），metadata 不丢
-                .map(DocumentWithScore::getOutput)
+                .map(PgVectorDocumentRetriever::stampScore)
                 .toList();
 
-        if (reranked.isEmpty()) {
-            log.debug("[pgvector] 重排后没有切片达到阈值 {}，按空结果处理", ragProperties.getRerankMinScore());
+        // 把「被阈值挡掉的那几条差多少分」也报出来：调 rerank-min-score 的时候，
+        // 这个数才是决定往上调还是往下调的依据。只报存活的那几条，等于让人靠猜
+        if (log.isInfoEnabled()) {
+            log.info("[pgvector] 重排得分（阈值 {}，取前 {}）：存活 {} 条{}",
+                    ragProperties.getRerankMinScore(), topN, reranked.size(),
+                    droppedScores(response, reranked.size()));
         }
         return reranked;
+    }
+
+    /**
+     * 把重排分数写进切片的元数据。
+     *
+     * <p>写 metadata 是安全的：{@code RagPrompts.DOCUMENT_FORMATTER} 只读
+     * index_id / doc_name / title / text 四个键，这个分数不会因此泄露给模型。
+     * 它服务于自检接口与日志——「这几条为什么被判为不相关」是有价值的排查信息。
+     */
+    private static Document stampScore(DocumentWithScore scored) {
+        scored.getOutput().getMetadata().put(META_SCORE, scored.getScore());
+        return scored.getOutput();
+    }
+
+    /** 格式化「没达到阈值的那几条各是多少分」，一条都没有时返回空串。 */
+    private static String droppedScores(RerankResponse response, int kept) {
+        List<Double> scores = response.getResults().stream()
+                .filter(result -> result != null && result.getScore() != null)
+                .map(result -> result.getScore().doubleValue())
+                .sorted(Comparator.reverseOrder())
+                .toList();
+        if (scores.size() <= kept) {
+            return "";
+        }
+        return "，未入选的 " + (scores.size() - kept) + " 条得分 "
+                + scores.subList(kept, scores.size()).stream()
+                .map(score -> "%.3f".formatted(score))
+                .collect(Collectors.joining("、"));
     }
 }

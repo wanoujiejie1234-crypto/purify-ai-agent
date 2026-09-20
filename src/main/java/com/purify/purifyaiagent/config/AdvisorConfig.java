@@ -3,6 +3,7 @@ package com.purify.purifyaiagent.config;
 import com.purify.purifyaiagent.advisor.LoggingAdvisor;
 import com.purify.purifyaiagent.advisor.ReReadingAdvisor;
 import com.purify.purifyaiagent.advisor.SensitiveWordAdvisor;
+import com.purify.purifyaiagent.advisor.SensitiveWordChecker;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -16,12 +17,21 @@ import org.springframework.context.annotation.Configuration;
 @Configuration
 public class AdvisorConfig {
 
+    /**
+     * 敏感词判据。做成 Bean 而不是在下面那个 Advisor 里 new，是因为
+     * {@code PurifyManus} 也要用同一份判据（它不走 Advisor 链），两边必须共用同一个实例。
+     */
     @Bean
-    public SensitiveWordAdvisor sensitiveWordAdvisor(SensitiveWordProperties properties) {
-        return new SensitiveWordAdvisor(
+    public SensitiveWordChecker sensitiveWordChecker(SensitiveWordProperties properties) {
+        return new SensitiveWordChecker(
                 properties.getWords(),
                 properties.getReplyMessage(),
                 properties.isEnabled());
+    }
+
+    @Bean
+    public SensitiveWordAdvisor sensitiveWordAdvisor(SensitiveWordChecker sensitiveWordChecker) {
+        return new SensitiveWordAdvisor(sensitiveWordChecker);
     }
 
     @Bean

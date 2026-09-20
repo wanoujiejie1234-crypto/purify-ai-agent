@@ -37,14 +37,17 @@ import java.util.Map;
  * {@link PgVectorRagConfig}——两条链路产出的都是 {@link KnowledgeBaseAdvisor}，
  * 上层（{@code SlimApp}）不需要知道下面换过。
  *
- * <p>本类受两个条件共同控制：{@code purify.rag.enabled} 且
- * {@code purify.rag.store=bailian}（<b>带 {@code matchIfMissing}，不写 store 时默认走这条</b>，
- * 保证这次的改动对既有行为零影响）。两个条件都写在类上——{@code @ConditionalOnProperty}
- * 在 Spring Boot 3.5 是可重复标注的。
+ * <p><b>装配条件</b>：{@code purify.rag.enabled} 且 {@code purify.rag.store} 是
+ * {@link RagStore#BAILIAN}（或压根不写）。整个类一起装配、一起不装配——本类产出的检索器
+ * 和 Advisor 都属于这一条链路，没有需要单独取舍的部分。
+ *
+ * <p>{@code matchIfMissing = true} 只出现在这一条链路上，不能挪到 pgvector 去：
+ * 不写 store 时要退回百炼，而不是把本地向量库也一起拉起来。
  */
 @Configuration
 @ConditionalOnProperty(prefix = "purify.rag", name = "enabled", havingValue = "true", matchIfMissing = true)
-@ConditionalOnProperty(prefix = "purify.rag", name = "store", havingValue = "bailian", matchIfMissing = true)
+@ConditionalOnProperty(prefix = RagStore.PREFIX, name = "store",
+        havingValue = RagStore.BAILIAN, matchIfMissing = true)
 public class RagConfig {
 
     /**
@@ -85,10 +88,11 @@ public class RagConfig {
      * {@code ifAvailable} 会安静地跳过——表现就是「RAG 没生效，但什么都不报」，
      * 属于最难查的一类故障。
      *
-     * <p><b>Bean 名与 pgvector 链路刻意保持一致</b>：两条链路互斥，正常只会有一个。
-     * 万一将来条件写错导致两个同时命中，Boot 默认禁止 Bean 定义覆盖，
-     * 会在启动期直接抛 {@code BeanDefinitionOverrideException}——比留到注入阶段
-     * 报含糊的 {@code NoUniqueBeanDefinitionException} 更容易定位。
+     * <p>Bean 名与 pgvector 链路那个刻意保持一致（都叫
+     * {@code knowledgeBaseRetrievalAdvisor}）。两条链路的装配条件在类级就是互斥的
+     * （store 不可能同时等于 bailian 和 pgvector），所以容器里永远只有一个，
+     * {@code SlimApp} 按 {@link KnowledgeBaseAdvisor} 类型取也就不会撞上
+     * {@code NoUniqueBeanDefinitionException}。
      */
     @Bean
     public KnowledgeBaseAdvisor knowledgeBaseRetrievalAdvisor(

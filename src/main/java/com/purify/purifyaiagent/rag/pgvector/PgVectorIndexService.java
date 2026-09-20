@@ -2,10 +2,12 @@ package com.purify.purifyaiagent.rag.pgvector;
 
 import com.purify.purifyaiagent.config.PgVectorProperties;
 import com.purify.purifyaiagent.config.RagProperties;
-import com.purify.purifyaiagent.exception.DocumentIndexException;
-import com.purify.purifyaiagent.exception.UnsupportedDocumentException;
+import com.purify.purifyaiagent.exception.ApiException;
+import com.purify.purifyaiagent.model.ChunkPreview;
 import com.purify.purifyaiagent.model.DocumentIndexResult;
 import com.purify.purifyaiagent.model.KnowledgeBaseStats;
+import com.purify.purifyaiagent.model.KnowledgeDocumentItem;
+import com.purify.purifyaiagent.model.KnowledgeDocumentPage;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.document.DocumentReader;
@@ -78,6 +80,18 @@ public class PgVectorIndexService {
 
     /** 表名/模式名的合法字符，与 {@code PgVectorSchemaValidator} 用的是同一套规则。 */
     private static final String SAFE_IDENTIFIER = "^[a-zA-Z0-9_]{1,64}$";
+
+    /** 预览最多列出几片。整份列出来在管理页上没法看，而「切成多少片」那个数仍然是真的。 */
+    private static final int PREVIEW_LIMIT = 20;
+
+    /** 预览里每片回显的正文长度。 */
+    private static final int PREVIEW_EXCERPT_LENGTH = 80;
+
+    /** 单页最多几份文档。挡一道，免得前端传个 size=100000 把整库拉进内存。 */
+    private static final int MAX_PAGE_SIZE = 200;
+
+    /** 元数据里没有分类时，分组统计显示的占位符。 */
+    private static final String UNLABELED = "(未标注)";
 
     private final VectorStore vectorStore;
 
@@ -155,6 +169,83 @@ public class PgVectorIndexService {
     }
 
     /**
+     * 索引前预览：这份文档会被切成什么样。<b>不写库、不调 Embedding 接口。</b>
+     *
+     * <p>走的是和 {@link #index} 完全相同的解析与切片，包括那些校验（编码不是 UTF-8、
+     * 内容为空、切片数撞上限都会照常抛）——预览要是走了另一条宽松的路，
+     * 它给的就是一个「上传之后才发现不是这样」的假象，比没有预览更糟。
+     *
+     * <p>代价是切片这一步会被重复做一次（预览一次、真上传一次）。这是划算的：
+     * 切片是纯本地计算，而真上传那次还要花 Embedding 的钱。
+     */
+    public ChunkPreview preview(String originalFilename, Resource resource, String classification) {
+        String source = requireFilename(originalFilename);
+        String category = requireKnownClassification(classification);
+
+        List<Document> chunks = split(read(resource, source, category), source);
+
+        long characters = chunks.stream().mapToLong(chunk -> chunk.getText().length()).sum();
+        boolean truncated = chunks.size() > PREVIEW_LIMIT;
+        List<ChunkPreview.Chunk> previews = chunks.stream()
+                .limit(PREVIEW_LIMIT)
+                .map(chunk -> new ChunkPreview.Chunk(
+                        // chunk_index 是 split() 打好的，和真正入库时的编号是同一个
+                        intOf(chunk.getMetadata().get(META_CHUNK_INDEX)),
+                        chunk.getText().length(),
+                        abbreviate(chunk.getText())))
+                .toList();
+
+        log.info("[pgvector索引] 预览 {}：分类={} 切片={} 字符={}（未写库）",
+                source, category, chunks.size(), characters);
+
+        return new ChunkPreview(source, category, chunks.size(), characters, previews, truncated);
+    }
+
+    /**
+     * 文档列表：按来源分组，一份文档一行。
+     *
+     * <p>{@link #stats()} 回答「有多少」，这个回答「有哪些」——管理页要能单独删掉某一份，
+     * 光有聚合计数做不到。两者不合并，是因为用途不同：统计页要的是分类分布，
+     * 管理页要的是逐份明细，硬塞进一个返回体只会让两边都别扭。
+     *
+     * <p>排序按最近入库时间倒序：刚传上去的排在最前面，符合「传完看一眼」的习惯。
+     */
+    public KnowledgeDocumentPage listDocuments(int page, int size) {
+        String table = qualifiedTableName();
+        int safeSize = Math.clamp(size, 1, MAX_PAGE_SIZE);
+        int safePage = Math.max(page, 1);
+        String classificationKey = safeMetadataKey(
+                ragProperties.getRouter().getFilterKey(), "purify.rag.router.filter-key");
+
+        Long total = pgJdbcTemplate.queryForObject(
+                "SELECT count(DISTINCT metadata->>'" + META_SOURCE + "') FROM " + table, Long.class);
+
+        // 分组里的 max()/min() 只是为了把「同一份文档的每一片都相同的那些字段」取出来一个。
+        // sum(length(content)) 是这一份文档真正入库的字符总量——拿它和原文件比对，
+        // 能一眼看出切片有没有把内容弄丢
+        String sql = "SELECT metadata->>'" + META_SOURCE + "' AS source, "
+                + "count(*) AS chunks, "
+                + "COALESCE(sum(length(content)), 0) AS characters, "
+                + "COALESCE(max(metadata->>'" + classificationKey + "'), '" + UNLABELED + "') AS classification, "
+                + "COALESCE(max(metadata->>'" + META_UPLOADED_AT + "'), '') AS uploaded_at "
+                + "FROM " + table + " "
+                + "GROUP BY 1 "
+                + "ORDER BY max(metadata->>'" + META_UPLOADED_AT + "') DESC NULLS LAST, 1 ASC "
+                + "LIMIT ? OFFSET ?";
+
+        List<KnowledgeDocumentItem> items = pgJdbcTemplate.query(sql, (resultSet, rowNum) ->
+                new KnowledgeDocumentItem(
+                        resultSet.getString("source"),
+                        resultSet.getLong("chunks"),
+                        resultSet.getLong("characters"),
+                        resultSet.getString("classification"),
+                        resultSet.getString("uploaded_at")),
+                safeSize, (long) (safePage - 1) * safeSize);
+
+        return new KnowledgeDocumentPage(total == null ? 0 : total, safePage, safeSize, items);
+    }
+
+    /**
      * 向量库概览。
      *
      * <p>这是本类唯一真正连库的方法——纯单元测试构造本类时会传 null 的 JdbcTemplate，
@@ -194,7 +285,7 @@ public class PgVectorIndexService {
                     .withIncludeCodeBlock(false)
                     .withIncludeBlockquote(true)
                     .build());
-            default -> throw new UnsupportedDocumentException(
+            default -> throw ApiException.unsupportedDocument(
                     "只支持 " + SUPPORTED_EXTENSIONS + " 这几种文本格式，当前文件是「" + source + "」，"
                             + "识别出的后缀是「" + normalizedExtension + "」。"
                             + "PDF / Word 需要先转成文本再上传。");
@@ -202,7 +293,7 @@ public class PgVectorIndexService {
 
         List<Document> documents = reader.get();
         if (documents.isEmpty() || documents.stream().allMatch(document -> !StringUtils.hasText(document.getText()))) {
-            throw new DocumentIndexException("文档内容为空，没什么可索引的：" + source);
+            throw ApiException.documentIndexFailed("文档内容为空，没什么可索引的：" + source);
         }
 
         String docName = source;
@@ -233,14 +324,14 @@ public class PgVectorIndexService {
         List<Document> chunks = splitter.apply(documents);
 
         if (chunks.isEmpty()) {
-            throw new DocumentIndexException("切片结果为空，文档可能只有空白字符：" + source);
+            throw ApiException.documentIndexFailed("切片结果为空，文档可能只有空白字符：" + source);
         }
 
         // TokenTextSplitter 到 maxNumChunks 就不再加了，超出的内容被静默丢弃。
         // 撞上上限就当作失败处理，而不是索引一份「只有前一半」的文档
         int maxNumChunks = pgVectorProperties.getChunk().getMaxNumChunks();
         if (chunks.size() >= maxNumChunks) {
-            throw new DocumentIndexException(
+            throw ApiException.documentIndexFailed(
                     "切片数达到上限 " + maxNumChunks + "，超出的内容会被丢弃。请把文档拆小后分几次上传，"
                             + "或调大 purify.rag.pgvector.chunk.max-num-chunks：" + source);
         }
@@ -261,7 +352,7 @@ public class PgVectorIndexService {
             replaced += text.chars().filter(character -> character == '�').count();
         }
         if (total > 0 && (double) replaced / total > REPLACEMENT_CHAR_RATIO_LIMIT) {
-            throw new DocumentIndexException(
+            throw ApiException.documentIndexFailed(
                     "文档内容不是有效的 UTF-8（" + replaced + "/" + total + " 个字符无法解码）：" + source
                             + "。请另存为 UTF-8 编码后重新上传。");
         }
@@ -275,7 +366,7 @@ public class PgVectorIndexService {
      */
     private String requireKnownClassification(String classification) {
         if (!StringUtils.hasText(classification)) {
-            throw new UnsupportedDocumentException("必须指定 classification（归档到哪一类）");
+            throw ApiException.unsupportedDocument("必须指定 classification（归档到哪一类）");
         }
         String category = classification.trim();
 
@@ -285,7 +376,7 @@ public class PgVectorIndexService {
                 .toList();
         // 分类表没配时不拦：配置缺失不该让上传功能整个不可用
         if (!known.isEmpty() && !known.contains(category)) {
-            throw new UnsupportedDocumentException(
+            throw ApiException.unsupportedDocument(
                     "未知的分类「" + category + "」，可选值来自 purify.rag.router.categories：" + known);
         }
         return category;
@@ -293,7 +384,7 @@ public class PgVectorIndexService {
 
     private static String requireFilename(String filename) {
         if (!StringUtils.hasText(filename)) {
-            throw new UnsupportedDocumentException("文件名不能为空：它同时用作切片来源标识，删改都靠它");
+            throw ApiException.unsupportedDocument("文件名不能为空：它同时用作切片来源标识，删改都靠它");
         }
         return filename.trim();
     }
@@ -321,7 +412,8 @@ public class PgVectorIndexService {
      * 这里只需要「按值分组」，普通取值语法更简单也更快。
      */
     private Map<String, Long> groupCount(String table, String metadataKey) {
-        String sql = "SELECT COALESCE(metadata->>'" + metadataKey + "', '(未标注)') AS key, count(*) AS total "
+        String key = safeMetadataKey(metadataKey, "purify.rag.router.filter-key");
+        String sql = "SELECT COALESCE(metadata->>'" + key + "', '" + UNLABELED + "') AS key, count(*) AS total "
                 + "FROM " + table + " GROUP BY 1 ORDER BY 2 DESC";
 
         Map<String, Long> counts = new LinkedHashMap<>();
@@ -336,5 +428,34 @@ public class PgVectorIndexService {
             throw new IllegalStateException(
                     propertyName + " 只能是字母、数字、下划线，且不超过 64 个字符，当前是：" + identifier);
         }
+    }
+
+    /**
+     * 元数据字段名要拼进 SQL，和表名一样先挡一道。
+     *
+     * <p>取值来自配置（{@code router.filter-key}），是开发者自己写的、不是外部输入，
+     * 所以这不是一个真实的注入面。但拼 SQL 的地方各自裸拼字符串迟早会出事——
+     * 表名那边已经立了「配置写错应当即刻失败」的规矩，这里沿用同一条。
+     * 顺带还有个好处：字段名写错（比如多加了个引号）会在第一次查询时就报出来，
+     * 而不是变成一句语法错误让人猜是哪里拼坏的。
+     */
+    private static String safeMetadataKey(String metadataKey, String propertyName) {
+        assertSafeIdentifier(metadataKey, propertyName);
+        return metadataKey;
+    }
+
+    /** 从元数据里取一个整数。类型对不上时退回 0，不让它把一次预览变成异常。 */
+    private static int intOf(Object value) {
+        return value instanceof Number number ? number.intValue() : 0;
+    }
+
+    private static String abbreviate(String text) {
+        if (text == null) {
+            return "";
+        }
+        String flattened = text.replaceAll("\\s+", " ").trim();
+        return flattened.length() <= PREVIEW_EXCERPT_LENGTH
+                ? flattened
+                : flattened.substring(0, PREVIEW_EXCERPT_LENGTH) + "…";
     }
 }

@@ -11,9 +11,9 @@ import java.util.List;
 /**
  * RAG 配置，对应 application.yml 中的 {@code purify.rag.*}。
  *
- * <p>知识库有<b>两条可以互相替代的链路</b>，用 {@link #store} 选其中一条：
+ * <p>知识库有<b>两条链路</b>，用 {@link #store} 选走哪一条（两者只能选一）：
  * <ul>
- *   <li>{@link Store#BAILIAN}（默认）—— 百炼云知识库。文档解析、切片、向量化、建索引、
+ *   <li>{@link Store#BAILIAN} —— 百炼云知识库。文档解析、切片、向量化、建索引、
  *       重排序全部由百炼托管，本地不建向量库、不装 Embedding 模型，
  *       只负责把提问发给检索接口、把命中的切片拼进 Prompt。</li>
  *   <li>{@link Store#PGVECTOR} —— 本地自建。文档由上传接口进来，本地切片、
@@ -36,15 +36,20 @@ import java.util.List;
 public class RagProperties {
 
     /**
-     * 用哪一条知识库链路。
+     * 走哪一条知识库链路。
      *
      * <p>用枚举而不是字符串，是为了拿到「配错就在启动期报错」这个行为：
      * {@code store: pgvectr} 这种拼写错误会让 Spring 在绑定期抛 {@code BindException}，
-     * 而不是两条链路都不装配、RAG 悄悄消失（那是最难查的一种故障）。
+     * 而不是几条链路都不装配、RAG 悄悄消失（那是最难查的一种故障）。
      *
-     * <p>唯一的漏网之鱼是大小写：枚举绑定本身很宽松，但配置类上的
-     * {@code @ConditionalOnProperty} 是拿原始字符串比对的，所以 yml 里必须写小写。
-     * 为此两个 RAG 配置类都会在启动日志里打出「当前生效的是哪一条链路」。
+     * <p><b>大小写是宽松的，这一条曾经被写反过，别再改回去</b>：枚举绑定本身不在乎大小写，
+     * 而配置类上的 {@code @ConditionalOnProperty} 内部用的是
+     * {@code havingValue.equalsIgnoreCase(实际值)}（见
+     * {@code OnPropertyCondition#isMatch}），所以 {@code store: PGVECTOR} 和 {@code pgvector}
+     * 的行为完全一样。曾经有注释说「配置类拿原始字符串比对、大小写写错会导致谁都不装配」，
+     * 那是错的——照它去排查会找一个根本不存在的故障。
+     *
+     * <p>真正配错（比如 {@code pgvectr}）仍然会在绑定期抛异常，上面那条还成立。
      */
     public enum Store {
 
@@ -68,9 +73,11 @@ public class RagProperties {
     private boolean enabled = true;
 
     /**
-     * 用哪一条链路，默认百炼——保证不写这一项时的行为与加它之前完全一致。
+     * 走哪一条链路，默认百炼——保证不写这一项时的行为与加它之前完全一致。
      *
-     * <p>取值必须小写：{@code bailian} 或 {@code pgvector}。
+     * <p>取值：{@code bailian} 或 {@code pgvector}（大小写不敏感，见 {@link Store}）。
+     * 写成别的值（包括曾经支持过的 {@code both}）会在启动期抛绑定异常，而不是静默失效——
+     * 两条链路要么装配、要么起不来，不存在「悄悄不查知识库」这种中间状态。
      */
     private Store store = Store.BAILIAN;
 

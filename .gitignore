@@ -3,6 +3,16 @@
 # 免得以后新建一个 application-prod.yml 之类又忘了加。
 application-local.yml
 HELP.md
+# 前端构建产物：由 `npm run build` 从 purify-ai-agent-fronted/ 生成到这里
+# （输出目录配在那个目录的 vite.config.js 里），再由 Spring Boot 当静态资源托管。
+# 不入库的理由：文件名带内容哈希，每改一次前端就整批换掉，进仓库只会是噪声，
+# 而它随时能用一条命令重建。跑之前记得先 `cd purify-ai-agent-fronted && npm run build`。
+src/main/resources/static/
+node_modules/
+# 运行时目录：工具写文件、下载文件都落在 tmp 下面（见 FileConstant），
+# 里面全是跑出来的临时产物，不该进仓库。tmp/download 还是对外暴露的目录
+# （StaticResourceConfig 把它映射到 /files/download/**），整个目录不入库更稳妥。
+tmp/
 target/
 .mvn/wrapper/maven-wrapper.jar
 !**/src/main/**/target/
