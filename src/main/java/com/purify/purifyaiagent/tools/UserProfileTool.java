@@ -34,10 +34,13 @@ import java.util.Optional;
  * 会直接抛 {@code IllegalArgumentException: ToolContext is required by the method as an argument}。
  * 这不是可以忽略的告警，是所有对话入口都要记得加的一行。
  *
- * <p><b>当前 userId 用的是会话 ID</b>（{@code chatId}），因为这个项目还没有登录体系，
- * chatId 是唯一的用户标识。代价是：换一个 chatId 就等于换了一个人，画像读不到。
- * 客户端复用同一个 chatId 就能跨轮次记住；将来接上登录后，只要把 SlimApp 里塞进
- * toolContext 的值换成真实用户 ID，这个类一个字都不用改。
+ * <p><b>userId 现在是真的用户 ID</b>：由 HTTP 层从 JWT 令牌里解出，
+ * 经 {@code AgentRun#userId()} 传到 {@code toolContext}。在这之前它用的是会话 ID
+ * （{@code chatId}），代价是「换一个会话就等于换了一个人」——同一个用户在轻语里说过的
+ * 身高体重，新开一个会话就查不到了。现在画像真正按人存，跨会话、跨链路都读得到。
+ *
+ * <p>这个类本身对这次切换<b>一个字都没改</b>：它一直只认 {@link #USER_ID_KEY} 这个键，
+ * 值从哪里来是外面的事。这正是当初把用户标识做成工具上下文而不是模型参数的回报。
  */
 @Slf4j
 public class UserProfileTool {

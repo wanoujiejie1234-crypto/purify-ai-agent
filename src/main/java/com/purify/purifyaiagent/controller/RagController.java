@@ -1,5 +1,6 @@
 package com.purify.purifyaiagent.controller;
 
+import com.purify.purifyaiagent.auth.RequireAdmin;
 import com.purify.purifyaiagent.exception.ApiException;
 import com.purify.purifyaiagent.model.RagSearchResult;
 import com.purify.purifyaiagent.rag.KnowledgeSearch;
@@ -26,10 +27,16 @@ import java.util.List;
  * <p>它的存在还有一个更直接的理由：用户反馈过「项目根本没有做任何在线检索工作」，
  * 而检索是悄悄发生的——命中也好、没查也好，从对话界面上看都是「模型开始回答了」。
  * 这个接口把中间状态暴露出来，让「它在工作」这件事可以被验证，而不是只能靠感觉。
+ *
+ * <p><b>{@link RequireAdmin}：它和 {@code KnowledgeBaseController} 同属知识库模块，
+ * 权限也要一致。</b>虽然它只读，但它原样吐回知识库切片的正文和来源文件名——
+ * 那是整站共用的语料，不是调用者自己的数据。既然「知识库模块只对超级用户开放」
+ * 是需求定下来的规则，那么给这个接口留一个普通用户能读的口子就等于没做这条规则。
  */
 @Slf4j
 @RestController
 @RequestMapping("/api/rag")
+@RequireAdmin
 @ConditionalOnProperty(prefix = "purify.rag", name = "enabled", havingValue = "true", matchIfMissing = true)
 public class RagController {
 

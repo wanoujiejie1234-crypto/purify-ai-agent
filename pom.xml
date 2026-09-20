@@ -29,6 +29,8 @@
     <properties>
         <java.version>21</java.version>
         <spring-ai.version>1.0.0</spring-ai.version>
+        <!-- jjwt 不在 Spring Boot 的 BOM 里，版本只能自己钉。三件套必须同版本 -->
+        <jjwt.version>0.12.6</jjwt.version>
     </properties>
 
     <dependencyManagement>
@@ -156,6 +158,57 @@
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
             <optional>true</optional>
+        </dependency>
+        <!--
+            密码哈希：只要 BCrypt，不要整个 Security。
+
+            这个项目引的是 spring-security-crypto 这一个 jar，不是 spring-boot-starter-security。
+            两者的差别不是体积，是行为：starter 会拉进一整套过滤器链并默认拦住**所有**请求，
+            那样现有十几个接口都要逐个去放行配置，配漏一个的表现是全线 401，
+            而排查方向会指向「看起来完全无关」的那个接口。本项目用自己的
+            AuthInterceptor + @RequireLogin / @RequireAdmin 做鉴权，只需要这一个工具类。
+
+            版本不写：由 spring-boot-starter-parent 统一管，写了反而会和 Spring Boot 的版本漂移。
+        -->
+        <dependency>
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-crypto</artifactId>
+        </dependency>
+        <!--
+            发验证码邮件。它只在 spring.mail.host 存在时才装配出 JavaMailSender，
+            而这个项目的取向是「配不齐就少一个功能，不影响启动」：
+            application.yml 里整个 spring.mail 块是注释掉的（见那里的说明），
+            邮件配置放在 application-local.yml；没配时 EmailSender 会退回「只打日志」，
+            注册流程照样能走通。
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-mail</artifactId>
+        </dependency>
+        <!--
+            JWT。刻意不手写 HS256：自己实现时最容易错的三处（签名用 String.equals 比、
+            信任 header 里的 alg、忘了验 exp）都是能编译、能跑通、只在被人攻击时才暴露的错。
+            这是整套栈里唯一有真实 CVE 形状的地方，用现成的库更划算。
+
+            jjwt 不在 Spring Boot 的 BOM 里，所以三个 artifact 都要自己写版本，且必须一致：
+            api 是编译期接口，impl 和 jackson 都只在运行期用得上（scope=runtime）。
+        -->
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-api</artifactId>
+            <version>${jjwt.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-impl</artifactId>
+            <version>${jjwt.version}</version>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-jackson</artifactId>
+            <version>${jjwt.version}</version>
+            <scope>runtime</scope>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>

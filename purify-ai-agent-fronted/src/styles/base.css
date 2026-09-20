@@ -1,11 +1,28 @@
 :root {
-  /* 两条链路的主题色。主页卡片、聊天页气泡都从这里取，保证同一条链路颜色一致 */
+  /* 两条链路的主题色。主页卡片、聊天页气泡都从这里取，保证同一条链路颜色一致。
+     这两个值是**各条链路自己的身份色**，不要拿它们做整站配色 */
   --slim: #10a37f;
   --manus: #6366f1;
+
+  /*
+   * 品牌主色（电光蓝）。只给「外壳」用：认证页、用户菜单、以及首页那些
+   * 不属于某条链路的元素。聊天页仍然用它那条链路的 --slim / --manus。
+   *
+   * 刻意**不做渐变**，尤其是青绿→紫那一挂——那是最快让人看出
+   * 「这是 AI 生成的落地页」的一招。这里全部是纯色 + 一层很淡的径向光晕。
+   */
+  --brand: #4d6bfe;
+  --brand-deep: #4166d5;
+  --brand-soft: #4d6bfe1f;
 
   --ink: #14161a;
   --page: #f6f7f9;
   --line: #e6e8ec;
+  /* 比 --line 深一档，给输入框的描边用：表单控件需要比卡片分隔线更明确一点 */
+  --line-strong: #d6dae3;
+  --muted: #6b7488;
+
+  --danger: #d94a4a;
 
   --font: system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
     'Microsoft YaHei', 'Noto Sans SC', sans-serif;
@@ -68,6 +85,161 @@ button {
 }
 *::-webkit-scrollbar-track {
   background: transparent;
+}
+
+/* ==========================================================================
+ * 表单基元
+ *
+ * 放在全局而不是放进 AuthShell 的 scoped 样式里，是因为它们要作用在**插槽内容**上：
+ * 三个认证页各自写自己的 <input>，而 scoped 样式只能命中组件自己的模板。
+ * （也可以用 :deep() 穿透，但那会让「哪些样式属于谁」变得含糊。）
+ *
+ * 这一套刻意保持素净：没有渐变、没有大圆角胶囊按钮、没有发光边框——
+ * 目的是让人一眼看懂「这里要填什么」，而不是让人觉得设计得很用力。
+ * ========================================================================== */
+
+.field {
+  display: block;
+  margin-top: 16px;
+}
+
+.field-label {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  color: #3d4658;
+}
+
+/* 标签行右侧的小字（「用户名已被占用」这类就地提示） */
+.field-hint {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.field-input {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: #fff;
+  color: var(--ink);
+  font: inherit;
+  font-size: 14px;
+  transition: border-color 0.16s ease, box-shadow 0.16s ease;
+}
+
+.field-input::placeholder {
+  color: #9aa3b4;
+}
+
+.field-input:focus {
+  outline: none;
+  border-color: var(--brand);
+  /* 焦点圈用主色的半透明版本：比默认 outline 柔和，又能一眼看出焦点在哪 */
+  box-shadow: 0 0 0 3px var(--brand-soft);
+}
+
+.field-input:disabled {
+  background: #f4f5f8;
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
+/* 验证码那一行：输入框占满剩余宽度，按钮固定宽度不被挤扁 */
+.field-row {
+  display: flex;
+  gap: 10px;
+  align-items: stretch;
+}
+.field-row .field-input {
+  flex: 1;
+  min-width: 0;
+}
+.field-row .btn-ghost {
+  flex: none;
+  white-space: nowrap;
+}
+
+.btn-primary {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  margin-top: 22px;
+  padding: 11px 18px;
+  border: none;
+  border-radius: 10px;
+  background: var(--brand);
+  color: #fff;
+  font-size: 14.5px;
+  font-weight: 500;
+  /* 阴影用主色本身而不是黑色：蓝底在白底上要「浮」起来，
+     靠同色系的投影比压一层灰自然 */
+  box-shadow: 0 10px 22px -14px rgba(77, 107, 254, 0.9);
+  transition: background 0.18s ease, transform 0.18s ease;
+}
+.btn-primary:hover:not(:disabled) {
+  background: var(--brand-deep);
+}
+.btn-primary:active:not(:disabled) {
+  transform: translateY(1px);
+}
+.btn-primary:disabled {
+  background: #b9c3e6;
+  box-shadow: none;
+  cursor: not-allowed;
+}
+
+/* 次要按钮：验证码那行的「获取验证码」。描边而不是填充，
+   因为它旁边就是一个主按钮，两个实心按钮会互相抢注意力 */
+.btn-ghost {
+  padding: 10px 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: #fff;
+  color: #3d4658;
+  font-size: 13px;
+  font-weight: 500;
+  transition: border-color 0.16s ease, color 0.16s ease;
+}
+.btn-ghost:hover:not(:disabled) {
+  border-color: var(--brand);
+  color: var(--brand);
+}
+.btn-ghost:disabled {
+  color: #a8b0c0;
+  cursor: not-allowed;
+}
+
+/* 报错条。红色只用在文字和细描边上，不做整块红底——
+   表单出错很常见，整块红底会把页面搞得很惊慌 */
+.form-error {
+  margin-top: 14px;
+  padding: 9px 12px;
+  border: 1px solid #f0c9c9;
+  border-radius: 9px;
+  background: #fdf4f4;
+  color: #a83838;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+/* 中性提示条（成功、或者「验证码已发送」这类不需要红色但也不该消失的信息） */
+.form-note {
+  margin-top: 14px;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #f7f9ff;
+  color: #4a5468;
+  font-size: 13px;
+  line-height: 1.6;
 }
 
 /*

@@ -200,12 +200,12 @@ public class PurifyManus extends ToolCallAgent {
      * 这个方法留给不走 HTTP 的调用方和测试——它和流式那条复用同一个循环，
      * 只是把结果攒起来再返回。
      */
-    public AgentResult chat(String chatId, String message) {
+    public AgentResult chat(String chatId, String userId, String message) {
         if (!acquire(chatId)) {
             return busy(chatId);
         }
         try {
-            AgentResult result = runBlocking(chatId, message);
+            AgentResult result = runBlocking(chatId, userId, message);
             record(chatId, message, answerOf(result), result.state(), result.steps());
             return result;
         }
@@ -221,7 +221,7 @@ public class PurifyManus extends ToolCallAgent {
      * 真正的执行发生在订阅时。若把闸门放在方法体里，调用方拿着流不订阅（比如请求刚进来就被
      * 网关掐了），闸门就永远关不上了。
      */
-    public Flux<AgentEvent> chatStream(String chatId, String message) {
+    public Flux<AgentEvent> chatStream(String chatId, String userId, String message) {
         return Flux.defer(() -> {
             if (!acquire(chatId)) {
                 return Flux.just(AgentEvent.error(busyMessage()));
@@ -231,7 +231,7 @@ public class PurifyManus extends ToolCallAgent {
             AtomicReference<AgentEvent> terminal = new AtomicReference<>();
             AtomicInteger steps = new AtomicInteger();
 
-            return runStream(chatId, message)
+            return runStream(chatId, userId, message)
                     .doOnNext(event -> {
                         if (event.state() != null) {
                             terminal.set(event);
@@ -252,16 +252,23 @@ public class PurifyManus extends ToolCallAgent {
      * 工具能看到的上下文，比父类多一样：用户是谁。
      *
      * <p>{@code UserProfileTool} 要靠它才知道读写谁的画像，而这个值不能由模型自己填——
-     * 模型会编一个出来，这次存的画像下次就找不回来了。所以从会话 ID 推出来，放在模型看不见的
-     * 工具上下文里。目前用会话 ID 当用户标识（项目还没有登录体系），将来接入登录后
-     * 换掉这里的取值即可，工具本身不用动。
+     * 模型会编一个出来，这次存的画像下次就找不回来了。所以它由 HTTP 层从令牌里解出来、
+     * 一路传到 {@link AgentRun}，再放进模型看不见的工具上下文里。
+     *
+     * <p><b>user id 为空时不要往 map 里塞 null</b>：{@code ToolContext} 的底层实现可能
+     * 对内容做防御性拷贝（拷贝构造通常会拒绝 null），而 {@code Map.of} 更是直接抛异常。
+     * 留键缺失才是安全的退化——{@code UserProfileTool} 已经能处理「上下文里没有这个键」，
+     * 会返回一句让模型转告用户的话，而不是让整个对话崩掉。
+     * 正常链路上这条分支走不到（聊天接口都要求登录），它是防「万一」的。
      */
     @Override
     protected Map<String, Object> toolContext(AgentRun run) {
         // 父类放进去的 HumanInterrupt 原样留着（那是「暂停等用户」的开关，本类也要用），
         // 这里只补一样：用户是谁
         Map<String, Object> context = new HashMap<>(super.toolContext(run));
-        context.put(UserProfileTool.USER_ID_KEY, run.chatId());
+        if (StringUtils.hasText(run.userId())) {
+            context.put(UserProfileTool.USER_ID_KEY, run.userId());
+        }
         return context;
     }
 

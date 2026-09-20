@@ -1,5 +1,5 @@
 import axios from 'axios'
-import { currentUserId } from '../user.js'
+import * as auth from '../auth.js'
 
 /**
  * 普通 JSON 请求走 axios。
@@ -9,7 +9,7 @@ import { currentUserId } from '../user.js'
  * 写死 http://localhost:8080 会同时踩两个坑——浏览器直连产生跨域，
  * 以及读不到 X-Chat-Id 这种自定义响应头。
  */
-const http = axios.create({
+export const http = axios.create({
   baseURL: '',
   // 默认 60 秒。放这么宽是因为只有上传建索引这一条链路会慢——它要调
   // DashScope 的 Embedding 接口，且服务端是按每批 10 条切片串行发请求的。
@@ -18,48 +18,130 @@ const http = axios.create({
 })
 
 /**
- * 每个请求都带上用户标识。
+ * 每个请求都带上令牌。
  *
  * 放在拦截器里而不是各调用点，是因为它必须**一个不漏**：少带一个接口，
- * 那个接口就会把数据记到 anonymous 名下，而这个错误不会报任何错——
- * 表现只是「换台机器登录，会话列表少了几条」。
+ * 那个接口就会 401，表现是「某个功能莫名其妙不能用」。
  *
- * 后端还没有登录体系，这个值由浏览器生成，取值理由见 user.js。
+ * 注意这条拦截器**管不到 SSE 那两条链路**——它们用原生 fetch，不走 axios
+ * （原因见 sse.js 的注释）。令牌要在那边单独加一次，少加的表现同样是 401。
  */
 http.interceptors.request.use((config) => {
-  config.headers['X-User-Id'] = currentUserId()
+  const current = auth.token()
+  if (current) {
+    config.headers.Authorization = `Bearer ${current}`
+  }
   return config
 })
 
 /**
- * 把 axios 的报错整理成一句人能直接看懂的话。
- * 后端错误体是 { code, message }，优先显示 message；
+ * 并发请求一起 401 时，只跳转一次。
+ *
+ * 一个页面在挂载时常常并发发出好几个请求（会话列表、历史、知识库统计……），
+ * 令牌一失效它们会同时 401。不挡一下的话就是连续好几次
+ * `window.location.assign`，浏览器会把跳转重排，用户看到的是页面抖了一下。
+ */
+let redirectingToLogin = false
+
+/**
+ * 该去登录页了。
+ *
+ * <p>**用 `window.location.assign` 而不是 `router.push`。** 两个原因：
+ * 一是在这里 `import router` 会形成一个真实的循环
+ * （`router → views → http.js → router`），而循环导入的表现是某个模块
+ * 在某些加载顺序下变成 `undefined`，只在特定入口才复现；
+ * 二是「你的会话结束了」本来就该是一次完整的重载——把一个已经失效的登录态
+ * 带进新页面，只会让新页面上的其他请求再撞一遍 401。
+ */
+function redirectToLogin() {
+  if (redirectingToLogin) return
+  redirectingToLogin = true
+  auth.clear()
+  const here = window.location.pathname + window.location.search
+  // 已经在登录页上就别再跳了，否则会把自己的 ?redirect= 覆盖掉
+  if (window.location.pathname === '/login') {
+    redirectingToLogin = false
+    return
+  }
+  window.location.assign(`/login?redirect=${encodeURIComponent(here)}`)
+}
+
+/**
+ * 把 axios 的报错整理成一句人能直接看懂的话，并处理鉴权相关的状态码。
+ *
+ * 后端错误体是 `{ code, message }`，优先显示 message；
  * 连不上后端（开发时最常见）单独特判，否则用户只会看到 "Network Error" 这种没用的英文。
  */
 http.interceptors.response.use(
   (res) => res,
   (err) => {
+    const status = err?.response?.status
     const serverMessage = err?.response?.data?.message
-    if (serverMessage) return Promise.reject(new Error(serverMessage))
+    // 把后端的错误码也挂在 Error 上。视图偶尔需要按码分支
+    // （比如 CODE_TOO_FREQUENT 要把「获取验证码」变成倒计时，
+    // 而不是弹一个「请求太频繁」的报错框），而只靠 message 文案去判断太脆
+    const serverCode = err?.response?.data?.code
+
+    // 401：没登录 / 令牌过期或伪造。清掉本地令牌去登录页。
+    // 这里**不做区分**：对用户来说两者的动作都是重新登录
+    if (status === 401) {
+      redirectToLogin()
+      return Promise.reject(new Error(serverMessage || '登录已失效，请重新登录。'))
+    }
+
+    // 403：身份是好的，只是权限不够。**绝对不能跳登录页、更不能清令牌**——
+    // 那样普通用户点到一个本不该看到的链接就被登出了，而实际上什么都没发生。
+    // 保持登录，把后端那句话原样抛出去，让调用方弹个提示就行
+    if (status === 403) {
+      return Promise.reject(new Error(serverMessage || '这个功能只对超级管理员开放。'))
+    }
+
+    if (serverMessage) return Promise.reject(failure(serverMessage, serverCode, status))
 
     if (err?.code === 'ECONNABORTED') {
-      return Promise.reject(new Error('请求超时，请稍后重试。'))
+      return Promise.reject(failure('请求超时，请稍后重试。'))
     }
     if (!err?.response) {
-      return Promise.reject(new Error('连不上后端服务（http://localhost:8080），请确认 Spring Boot 已经启动。'))
+      return Promise.reject(failure('连不上后端服务（http://localhost:8080），请确认 Spring Boot 已经启动。'))
     }
-    if (err.response.status === 404) {
-      return Promise.reject(new Error('请求的资源不存在（404）。'))
+    if (status === 404) {
+      return Promise.reject(failure('请求的资源不存在（404）。', undefined, 404))
     }
-    return Promise.reject(new Error(`请求失败（HTTP ${err.response.status}）`))
+    return Promise.reject(failure(`请求失败（HTTP ${status}）`, undefined, status))
   },
 )
+
+/**
+ * 造一个带着后端错误码和 HTTP 状态的 Error。
+ *
+ * 用 `Error` 而不是自定义类型：调用方已经习惯了 `try/catch` + `err.message`，
+ * 换成自定义类会让现有那些 catch 拿不到 message（它们大多只读 message）。
+ * 额外挂上去的 `code` / `status` 是加法，不破坏任何东西——
+ * 不关心它们的地方照旧只看 message。
+ *
+ * `status` 是需要的：`ChatRoom` 要按 404 分支（「这个会话没了，开个新的」），
+ * 而 404 在这里有两个来源（后端明确说的、和框架兜底的），
+ * 用 message 文案去认太脆。
+ */
+function failure(message, code, status) {
+  const error = new Error(message)
+  if (code) error.code = code
+  if (status) error.status = status
+  return error
+}
 
 /* ------------------------------------------------------------------ 对话历史 */
 
 /**
  * 读历史记录。link 传 'slim' 或 'manus'。
- * 会话不存在或还没聊过时后端返回 []，这是正常结果，不要当错误处理。
+ *
+ * **这个接口现在会 404**，而且要当正常结果处理：会话不存在、已被删除、
+ * 或者不属于当前用户，后端一律返回 404 且是同一句话（分开的话它就成了一个
+ * 存在性探测口子，见后端 `SessionAccess` 的说明）。
+ *
+ * 调用方要为此配合两件事：新生成的 chatId 不要去调它（必然 404），
+ * 而从 sessionStorage 恢复出来的旧 id 真 404 时提示一句再开新会话。
+ * 后端返回的 message 已经写好了（「会话不存在或已被删除」），直接显示即可。
  */
 export async function fetchHistory(link, chatId) {
   const { data } = await http.get(`/api/${link}/history`, { params: { chatId } })

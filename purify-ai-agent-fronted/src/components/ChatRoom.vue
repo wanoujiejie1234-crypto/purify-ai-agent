@@ -3,6 +3,8 @@ import { ref, reactive, computed, nextTick, onMounted, onBeforeUnmount } from 'v
 import { fetchHistory, fetchSessions, renameSession, deleteSession } from '../api/http.js'
 import { streamChat } from '../api/sse.js'
 import { renderMarkdown } from '../markdown.js'
+import { SLIM, MANUS } from '../chatConfig.js'
+import UserMenu from './UserMenu.vue'
 
 /**
  * 轻语和 PurifyManus 共用的聊天室。
@@ -28,7 +30,10 @@ const props = defineProps({
 /* ------------------------------------------------------------------ 会话 id */
 
 // 用 sessionStorage 而不是 localStorage：刷新页面要接着刚才那段聊，
-// 但新开一个标签页应当是一个新会话。用户标识则相反，那个要长期不变（见 user.js）
+// 但新开一个标签页应当是一个新会话。（登录态则相反，那个要长期不变，见 auth.js。）
+//
+// 这个键的前缀必须和 auth.js 里的 CHAT_ID_PREFIX 一致——退出登录时它按前缀清理，
+// 对不上的话换个人登录会继承上一个人的 chatId，打开就是「会话不存在」
 const STORAGE_KEY = `purify:chatId:${props.link}`
 
 const chatId = ref('')
@@ -38,6 +43,54 @@ function createChatId() {
   // crypto.randomUUID 需要安全上下文（https 或 localhost），本地开发满足条件
   return crypto.randomUUID()
 }
+
+/* --------------------------------------------------------------- 侧栏折叠 */
+
+/**
+ * 侧边栏是否折叠成细窄条。
+ *
+ * 存在 localStorage 而不是 sessionStorage：这是**用户对这个界面的偏好**，
+ * 和会话 id 不一样——它不该因为开个新标签页就变回去。
+ */
+const COLLAPSE_KEY = 'purify:sidebarCollapsed'
+
+const collapsed = ref(false)
+
+function toggleCollapse() {
+  collapsed.value = !collapsed.value
+  try {
+    localStorage.setItem(COLLAPSE_KEY, collapsed.value ? '1' : '0')
+  } catch {
+    // 存不下就退化成「本次会话内有效」，不影响使用
+  }
+}
+
+/**
+ * 是不是窄屏（侧边栏变成抽屉、默认收在画外）。
+ *
+ * 用途只有一个：决定顶栏要不要放那个用户菜单。侧边栏可见时它底部已经有了，
+ * 顶栏再放一个就是同一个东西出现两次；而侧边栏不可见时（折叠了，或者窄屏收起来了）
+ * 没有它用户就没法退出登录。
+ *
+ * 断点必须和样式里那个 `@media (max-width: 900px)` 一致——两处对不上的话，
+ * 会出现「侧边栏收在画外，顶栏也没有菜单」的窗口，用户找不到退出按钮。
+ */
+const NARROW_QUERY = '(max-width: 900px)'
+
+const narrow = ref(false)
+let mediaQuery = null
+
+function onMediaChange(event) {
+  narrow.value = event.matches
+}
+
+/**
+ * 另一条链路的信息。侧边栏顶部那个切换按钮用它。
+ *
+ * 从 `chatConfig.js` 取而不是写死：主题色和标题在那边定义过一次，
+ * 再抄一份到这里迟早会漂移（改了主页卡片的颜色，切换按钮还是旧的）
+ */
+const otherLink = computed(() => (props.link === SLIM.link ? MANUS : SLIM))
 
 /* ------------------------------------------------------------------- 状态 */
 
@@ -71,16 +124,42 @@ async function loadSessions() {
   }
 }
 
-function startNewSession() {
+/**
+ * 开一个新会话。
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.keepNotice] 保留当前那条提示。给 loadHistory 的 404 分支用——
+ *        它刚写下「这个会话已经不存在了」，而清空提示就在下一行，用户什么都看不到
+ */
+function startNewSession(opts = {}) {
   if (streaming.value) stop()
   chatId.value = createChatId()
-  sessionStorage.setItem(STORAGE_KEY, chatId.value)
+  // 这里**不写 sessionStorage**，见 persistChatId 的说明
   messages.value = []
   input.value = ''
-  historyError.value = ''
+  if (!opts.keepNotice) historyError.value = ''
   stick.value = true
   sidebarOpen.value = false
   nextTick(autoGrow)
+}
+
+/**
+ * 把当前 chatId 记进 sessionStorage。
+ *
+ * **只在真的要发消息时才调**，不在新会话创建时调。差别很具体：
+ * 会话行是发第一条消息时由后端建出来的（`touch`），所以「建了 chatId 但没说话」
+ * 的会话在库里根本不存在。如果创建时就落盘，那么用户打开页面、什么都没发、
+ * 刷新一下——这一次 `restored` 为真，会去拉历史，然后拿到 404，
+ * 界面上弹出一句「这个会话已经不存在了」，而用户其实什么都没做错。
+ *
+ * 只在发送时落盘，「本地有 id」就等价于「这个会话真的存在过」，那个误报就没有了。
+ */
+function persistChatId() {
+  try {
+    sessionStorage.setItem(STORAGE_KEY, chatId.value)
+  } catch {
+    // 存不下就退化成「刷新后开新会话」。不影响当前这次对话
+  }
 }
 
 async function selectSession(id) {
@@ -90,6 +169,7 @@ async function selectSession(id) {
     return
   }
   chatId.value = id
+  // 从侧边栏点进来的会话一定存在于库里（列表是后端给的），所以这里可以直接记
   sessionStorage.setItem(STORAGE_KEY, id)
   messages.value = []
   historyError.value = ''
@@ -227,8 +307,10 @@ async function send(preset) {
         // 万一它纠正了 id，后续请求必须跟着它走，否则历史就对不上了。
         if (id !== chatId.value) {
           chatId.value = id
-          sessionStorage.setItem(STORAGE_KEY, id)
         }
+        // 走到这里说明这一轮真的发出去了，会话行已经由后端建出来 ——
+        // 这才是该把 id 记下来的时机，见 persistChatId
+        persistChatId()
       },
       onEvent: ({ event, payload }) => {
         handleEvent(event, payload, reply)
@@ -380,6 +462,15 @@ async function loadHistory() {
     scrollToBottom(true)
   } catch (err) {
     if (requested !== chatId.value) return
+    // 404 单独处理：这个会话不存在、已被删除，**或者不属于当前账号**。
+    // 本地却还记着它的 id（比如换了个账号登录，或者会话在另一个标签页被删了），
+    // 这时留着这个 id 只会一直报错 —— 直接开一个新会话，
+    // 并把刚才那句话留在提示条上告诉用户发生了什么
+    if (err?.status === 404) {
+      historyError.value = '这个会话已经不存在了，已为你开了个新会话。'
+      startNewSession({ keepNotice: true })
+      return
+    }
     // 后端没起来时拉不到历史，但不该把页面卡住：给一条提示，用户照样能发消息
     historyError.value = friendlyError(err)
   }
@@ -508,18 +599,45 @@ function onKeydown(e) {
 /* ----------------------------------------------------------------- 生命周期 */
 
 onMounted(async () => {
-  const saved = sessionStorage.getItem(STORAGE_KEY)
+  let saved = null
+  try {
+    saved = sessionStorage.getItem(STORAGE_KEY)
+  } catch {
+    // 读不出来就当作新会话
+  }
+  // 有本地记录才叫「恢复」。它等价于「这个会话发过消息」——
+  // 因为 chatId 只在发送成功后才落盘（见 persistChatId）
+  const restored = Boolean(saved)
   chatId.value = saved || createChatId()
-  if (!saved) sessionStorage.setItem(STORAGE_KEY, chatId.value)
+
+  try {
+    collapsed.value = localStorage.getItem(COLLAPSE_KEY) === '1'
+  } catch {
+    // 读不出来就用默认的展开态
+  }
+
+  // matchMedia 而不是监听 window.resize：只在跨越断点时才触发，
+  // 而 resize 在拖动窗口时会每秒触发几十次
+  mediaQuery = window.matchMedia(NARROW_QUERY)
+  narrow.value = mediaQuery.matches
+  mediaQuery.addEventListener('change', onMediaChange)
 
   autoGrow()
-  // 两件事互不依赖，一起发出去，别串行等
-  await Promise.all([loadHistory(), loadSessions()])
+
+  // **新会话不要去拉历史。** 后端现在会校验归属，一个还没建出来的 chatId
+  // 必然返回 404，于是每次打开聊天页都会先闪一条「会话不存在」的错误。
+  // 只有从 sessionStorage 恢复出来的（或从侧边栏点开的）才值得去问一次
+  if (restored) {
+    await Promise.all([loadHistory(), loadSessions()])
+  } else {
+    await loadSessions()
+  }
 })
 
 onBeforeUnmount(() => {
   // 离开页面时把在飞的请求掐掉，避免流还挂着、回调打到已经卸载的组件上
   controller?.abort()
+  mediaQuery?.removeEventListener('change', onMediaChange)
 })
 </script>
 
@@ -529,19 +647,54 @@ onBeforeUnmount(() => {
     <!-- 遮罩只在窄屏出现，点它收起侧边栏；宽屏下它 display:none，不拦截点击 -->
     <div v-if="sidebarOpen" class="scrim" @click="sidebarOpen = false"></div>
 
-    <aside class="side" :class="{ open: sidebarOpen }">
+    <aside class="side" :class="{ open: sidebarOpen, collapsed }">
       <div class="side-head">
-        <RouterLink to="/" class="brand" title="返回主页">
+        <RouterLink v-if="!collapsed" to="/" class="brand" title="返回主页">
           <span class="dot" aria-hidden="true"></span>
           <span class="brand-name">{{ title }}</span>
         </RouterLink>
+        <span v-else class="dot solo" aria-hidden="true"></span>
+
+        <!-- 折叠开关。宽屏才显示：窄屏用的是顶栏那个抽屉按钮，
+             两个都留会让人分不清按哪个 -->
+        <button
+          class="collapse-btn"
+          type="button"
+          :title="collapsed ? '展开侧边栏' : '收起侧边栏'"
+          :aria-expanded="!collapsed"
+          @click="toggleCollapse"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="3" y="4" width="18" height="16" rx="2" />
+            <path d="M9 4v16" />
+          </svg>
+        </button>
       </div>
 
-      <button class="new-chat" type="button" @click="startNewSession">
+      <!-- 链路切换。两条链路以前各占首页一张卡片，现在只差一次点击——
+           这也是它存在的理由：用轻语聊到一半想交给 PurifyManus，不用先回首页 -->
+      <RouterLink
+        v-if="!collapsed"
+        class="switch"
+        :to="`/${otherLink.link}`"
+        :style="{ '--sw': otherLink.accent }"
+        :title="`切换到 ${otherLink.title}`"
+      >
+        <span class="switch-dot" aria-hidden="true"></span>
+        <span class="switch-text">
+          <span class="switch-label">切换到</span>
+          <span class="switch-name">{{ otherLink.title }}</span>
+        </span>
+        <svg class="switch-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M5 12h14M13 6l6 6-6 6" />
+        </svg>
+      </RouterLink>
+
+      <button class="new-chat" type="button" :title="collapsed ? '新会话' : null" @click="startNewSession">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true">
           <path d="M12 5v14M5 12h14" />
         </svg>
-        新会话
+        <span v-if="!collapsed">新会话</span>
       </button>
 
       <p v-if="sessionsError" class="side-error">{{ sessionsError }}</p>
@@ -584,8 +737,11 @@ onBeforeUnmount(() => {
         </div>
       </nav>
 
+      <!-- 侧边栏底部：用户信息 + 退出登录。
+           以前这里是一个光秃秃的「知识库」链接，现在它收进了用户菜单里
+           （而且只对超级用户显示，见 UserMenu） -->
       <div class="side-foot">
-        <RouterLink to="/knowledge" class="side-link">知识库</RouterLink>
+        <UserMenu direction="up" />
       </div>
     </aside>
 
@@ -602,8 +758,11 @@ onBeforeUnmount(() => {
         <h1 class="name">{{ title }}</h1>
 
         <button class="ghost" type="button" @click="startNewSession">新会话</button>
-        <!-- 悬停显示完整 id，方便和后端日志对上 -->
+        <!-- 悬停显示完整 id，方便和后端日志对上。折叠侧栏时它也跟着收起来 ——
+             那时候底部那个用户菜单看不见，顶栏这个得顶上 -->
         <span class="chatid" :title="chatId">{{ shortId }}</span>
+        <!-- 侧边栏看得见时它底部已经有一个了，这里不重复放 -->
+        <UserMenu v-if="collapsed || narrow" direction="down" />
       </header>
 
       <div ref="listEl" class="list" @scroll.passive="onScroll">
@@ -699,10 +858,142 @@ onBeforeUnmount(() => {
   width: 264px;
   border-right: 1px solid var(--line);
   background: #fbfbfc;
+  /* 折叠时宽度变窄，用过渡而不是瞬间跳变：整个页面会跟着重排，
+     突变看起来像卡了一下 */
+  transition: width 0.2s cubic-bezier(0.16, 0.84, 0.44, 1);
+}
+
+/* 折叠态：只留图标。
+   56px 是「28px 图标 + 两边各 14px」，能放下那颗新会话按钮 */
+.side.collapsed {
+  width: 56px;
+}
+.side.collapsed .side-head {
+  padding: 14px 0 6px;
+  display: flex;
+  justify-content: center;
+}
+.side.collapsed .new-chat {
+  /* 去掉文字之后按钮变成方的，左右外边距要收窄，不然会被挤扁 */
+  margin-inline: 8px;
+  padding-inline: 0;
+  justify-content: center;
+}
+.side.collapsed .side-foot {
+  padding-inline: 6px;
+}
+.side.collapsed .sessions,
+.side.collapsed .side-error,
+.side.collapsed .side-empty {
+  /* 窄轨里放不下会话标题。藏起来而不是截断成几个字——
+     截断出来的「我 175…」比没有更难看，而且点不着 */
+  display: none;
 }
 
 .side-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   padding: 14px 16px 6px;
+}
+
+/* 折叠时只剩品牌点，居中显示 */
+.dot.solo {
+  margin: 0;
+}
+
+.collapse-btn {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  margin-left: auto;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: #98a0b0;
+  transition: background 0.16s ease, color 0.16s ease;
+}
+.collapse-btn:hover {
+  background: rgba(10, 15, 30, 0.06);
+  color: #4a5468;
+}
+.collapse-btn svg {
+  width: 16px;
+  height: 16px;
+}
+.side.collapsed .collapse-btn {
+  margin-left: 0;
+}
+
+/* ------------------------------------------------ 链路切换（轻语 ⇄ Manus） */
+
+/*
+ * 它长得像一张卡片而不是一行链接，是因为它的作用是「换一条链路」——
+ * 那是这个界面里最重的一次切换（会换掉整个会话列表和主题色），
+ * 做成普通链接容易被当成「返回上一页」那类导航。
+ *
+ * 用目标链路的颜色（--sw），不是当前那条：这是「你要去的地方」的预览。
+ */
+.switch {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 6px 14px 2px;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: #fff;
+  color: inherit;
+  text-decoration: none;
+  transition: border-color 0.18s ease, background 0.18s ease;
+}
+.switch:hover {
+  border-color: var(--sw);
+  background: #fdfdff;
+}
+
+.switch-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--sw);
+}
+
+.switch-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+}
+
+.switch-label {
+  color: #9aa2b2;
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+}
+
+.switch-name {
+  overflow: hidden;
+  color: #2c3444;
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.switch-arrow {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  color: var(--sw);
+  transition: transform 0.24s cubic-bezier(0.16, 0.84, 0.44, 1);
+}
+.switch:hover .switch-arrow {
+  transform: translateX(3px);
 }
 
 .brand {
@@ -847,14 +1138,6 @@ onBeforeUnmount(() => {
   border-top: 1px solid var(--line);
 }
 
-.side-link {
-  color: #6b7381;
-  font-size: 12.5px;
-  text-decoration: none;
-}
-.side-link:hover {
-  color: var(--accent);
-}
 
 /* 窄屏时侧边栏浮在内容之上，靠遮罩点击收起 */
 .scrim {
@@ -1420,6 +1703,37 @@ textarea::placeholder {
   }
   .side.open {
     transform: translateX(0);
+  }
+  /*
+   * 窄屏下「折叠」这个状态没有意义：侧边栏本来就收在画外，展开时它要占满
+   * 抽屉的宽度。不禁掉的话，一个在宽屏折起侧栏、再把窗口缩窄的用户会得到一个
+   * 56px 宽的抽屉——里面的会话标题全被 `.collapsed` 那条规则藏了，看起来像空的。
+   */
+  .side.collapsed {
+    width: 264px;
+  }
+  .side.collapsed .side-head {
+    display: flex;
+    padding: 14px 16px 6px;
+  }
+  .side.collapsed .new-chat {
+    margin-inline: 0;
+    padding-inline: 0;
+    justify-content: flex-start;
+  }
+  .side.collapsed .side-foot {
+    padding-inline: 14px;
+  }
+  /* 这三个都是块级元素（nav / p），恢复成它们本来的 display。
+     写成 flex 的话会话项会横着排 */
+  .side.collapsed .sessions,
+  .side.collapsed .side-error,
+  .side.collapsed .side-empty {
+    display: block;
+  }
+  /* 抽屉里不需要折叠按钮：关掉它是靠点遮罩，不是靠这个开关 */
+  .collapse-btn {
+    display: none;
   }
   .scrim {
     display: block;

@@ -1,6 +1,7 @@
 package com.purify.purifyaiagent.exception;
 
 import lombok.Getter;
+import org.springframework.http.HttpStatus;
 
 /**
  * 「客户端传错了东西」这一类异常的统称，由 {@code GlobalExceptionHandler} 统一翻译成
@@ -43,12 +44,55 @@ public class ApiException extends RuntimeException {
     /** 文档收下了，但建索引这一步做不下去：内容为空、编码不是 UTF-8、切片数撞上限。 */
     public static final String DOCUMENT_INDEX_FAILED = "DOCUMENT_INDEX_FAILED";
 
-    /** 返回给前端的错误码，取值是上面四个常量之一。 */
+    /**
+     * 注册/找回密码这条链路上「输入的东西不对」：用户名被占用、邮箱已注册、
+     * 两次密码不一致、验证码错误或已过期。
+     *
+     * <p>和「没登录/没权限」不是一回事——那两类归 {@code AuthException}（401 / 403）。
+     * 这里全都是 400：客户端还没开始干活就能判定它传错了。
+     */
+    public static final String AUTH_INVALID = "AUTH_INVALID";
+
+    /**
+     * 验证码要得太频繁，还在 60 秒的冷却里。
+     *
+     * <p>单开一个码而不是并进 {@code AUTH_INVALID}：前端要据此把「重新获取」
+     * 那个按钮变成倒计时，而不是弹一个报错框。消息里带着剩余秒数。
+     */
+    public static final String CODE_TOO_FREQUENT = "CODE_TOO_FREQUENT";
+
+    /**
+     * 要的东西不存在，或者存在但不属于调用方（两者故意不可区分）。
+     *
+     * <p>唯一一个返回 404 而不是 400 的码，见 {@link #notFound}。
+     */
+    public static final String NOT_FOUND = "NOT_FOUND";
+
+    /** 返回给前端的错误码，取值是上面几个常量之一。 */
     private final String code;
 
+    /**
+     * HTTP 状态码。绝大多数情况是 400，只有 {@link #notFound} 用 404。
+     *
+     * <p><b>为什么最后还是给它加了个状态字段</b>：原来的设计是「这一类比全都是
+     * 『还没开始干活就判定客户端传错了』，统一 400 是准确的」。接入登录之后多出来一种
+     * 不属于这一类的错误——「这个会话不存在，或者不属于你」。它必须返回 404，
+     * 因为那是删除/改名接口已经定下的口径（{@code ChatSessionRepository#delete}
+     * 的注释里写了理由），而前端也要靠状态码区分「接口坏了」和「这个会话没了」。
+     *
+     * <p>于是这里保留了一个默认值 400 的重载，让原有那几类一个字都不用改——
+     * 只有明确需要别的状态码时才用带状态的工厂方法。
+     */
+    private final HttpStatus status;
+
     private ApiException(String code, String message) {
+        this(code, message, HttpStatus.BAD_REQUEST);
+    }
+
+    private ApiException(String code, String message, HttpStatus status) {
         super(message);
         this.code = code;
+        this.status = status;
     }
 
     /**
@@ -78,5 +122,36 @@ public class ApiException extends RuntimeException {
     /** 文档收下了，但解析/切片/写入做不下去。 */
     public static ApiException documentIndexFailed(String message) {
         return new ApiException(DOCUMENT_INDEX_FAILED, message);
+    }
+
+    /**
+     * 注册/找回密码的输入不合法。
+     *
+     * <p>{@code message} 会被原样显示给用户，所以它是写给用户看的——
+     * 别写「唯一索引冲突」这种内部说法，写「这个用户名已经被占用了」。
+     */
+    public static ApiException authInvalid(String message) {
+        return new ApiException(AUTH_INVALID, message);
+    }
+
+    /** 验证码要得太频繁。消息里要带上还剩几秒，前端拿它做倒计时。 */
+    public static ApiException codeTooFrequent(String message) {
+        return new ApiException(CODE_TOO_FREQUENT, message);
+    }
+
+    /**
+     * 请求的那个东西不存在——**或者存在但不属于调用方**。
+     *
+     * <p>两种情况的响应完全一致，这一点是刻意的：区分开来，这个接口就成了一个
+     * 存在性探测器，能问出「这个 ID 是不是真的存在」。{@code ChatSessionRepository}
+     * 的删除和改名早就是按这个口径处理的（「不额外报错，免得变成
+     * 『这个 ID 是存在的，只是不属于你』的信息泄露口子」），这里只是把它
+     * 扩展到读取路径上。
+     *
+     * <p>{@code message} 也要统一（见 {@code SessionAccess} 里的常量），
+     * 否则光靠错别字就能把两种情况分辨出来。
+     */
+    public static ApiException notFound(String message) {
+        return new ApiException(NOT_FOUND, message, HttpStatus.NOT_FOUND);
     }
 }

@@ -1,5 +1,6 @@
 package com.purify.purifyaiagent.controller;
 
+import com.purify.purifyaiagent.auth.RequireAdmin;
 import com.purify.purifyaiagent.config.PgVectorProperties;
 import com.purify.purifyaiagent.config.RagStore;
 import com.purify.purifyaiagent.exception.ApiException;
@@ -42,10 +43,19 @@ import java.util.List;
  * 在不在」和「接口在不在」永远是同一件事。漏了的话 Bean 建了、接口却 404，
  * 本地那一路从此没有灌数据的入口。两边都引用 {@link RagStore} 里的常量，
  * 就是为了让这个一致性由编译器保证，而不是靠人记着。
+ *
+ * <p><b>{@link RequireAdmin}：这一整个模块只对超级用户开放。</b>类级注解覆盖了下面全部方法
+ * （上传、批量上传、预览、删除、列表、统计），因为这些动作改的都<b>不是自己一个人的数据</b>——
+ * 知识库是全站共用的，删一份文档会影响所有人的问答。普通用户照样能<b>聊</b>天、
+ * 照样能<b>查</b>知识库，他们只是不能改它。
+ *
+ * <p>注意 {@code RagController}（{@code /api/rag/search}）也标了同一个注解——
+ * 那个接口返回的就是知识库内容，属于同一个模块，不一起管起来等于留了个后门。
  */
 @Slf4j
 @RestController
 @RequestMapping("/api/knowledge")
+@RequireAdmin
 @ConditionalOnProperty(prefix = "purify.rag", name = "enabled", havingValue = "true", matchIfMissing = true)
 @ConditionalOnProperty(prefix = RagStore.PREFIX, name = "store", havingValue = RagStore.PGVECTOR)
 public class KnowledgeBaseController {

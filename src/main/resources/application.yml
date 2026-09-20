@@ -14,6 +14,34 @@ spring:
       max-file-size: 10MB
       max-request-size: 12MB
 
+  # ==================== 邮件：注册 / 找回密码的验证码 ====================
+  # 这个块**故意整个注释掉**，不是懒得填。
+  #
+  # MailSenderAutoConfiguration 的条件是「classpath 上有 JavaMailSender 且配了
+  # spring.mail.host」（或存在一个 MimeMessage 的监听器）。写成 host: ${MAIL_HOST:}
+  # 这种「存在但为空」的形式，条件仍可能满足，于是容器里有一个 JavaMailSender，
+  # 但它要到真正发送时才报错——失败点从「装配期」被推到了「用户点注册时」。
+  # 整个块缺席则自动配置不生效，EmailSender 里的 ObjectProvider 拿不到东西，
+  # 干净地退化成「只打日志」，这也正是本项目对其他可选依赖的一贯做法
+  # （见 ToolConfig 对缺密钥工具的处理、SlimApp 对可选 Advisor 的处理）。
+  #
+  # 要用邮件时把下面这段复制到 application-local.yml（那个文件被 gitignore 挡住，
+  # 里面有授权码），并把 purify.auth.mail.enabled 改成 true：
+  #
+  # spring:
+  #   mail:
+  #     host: smtp.qq.com        # 465 端口配 ssl；用 587 的话改成 starttls
+  #     port: 465
+  #     username: you@qq.com
+  #     password: "授权码，不是邮箱登录密码"   # QQ/163 都要去网页端单独生成授权码
+  #     default-encoding: UTF-8
+  #     properties:
+  #       mail.smtp.auth: true
+  #       mail.smtp.ssl.enable: true
+  #       # 超时压短：验证码是用户在线等着的东西，与其让他干等 30 秒不如早点报错
+  #       mail.smtp.connectiontimeout: 5000
+  #       mail.smtp.timeout: 5000
+
   # ==================== 建表：用户画像 ====================
   # 对话记忆那张表由 Spring AI 自己管（见下面的 spring.ai.chat.memory.repository.jdbc），
   # 用户画像这两张表是项目自己的，交给 Boot 的脚本初始化。
@@ -31,6 +59,9 @@ spring:
         # 会话表（侧边栏的每一项）。它和上面那张的分工也写在脚本注释里：
         # 那个存「一轮问答」，这个存「一个会话」——谁、叫什么名字、什么时候聊的
         - classpath:db/chat-session-schema-mysql.sql
+        # 用户与邮箱验证码。脚本里还有一段注释掉的老数据清理 SQL，
+        # 以及「为什么 role 列和两个唯一索引要交给 SchemaGuard 补」的说明
+        - classpath:db/auth-schema-mysql.sql
 
   ai:
     # ---------------- 对话记忆：官方 JdbcChatMemoryRepository ----------------
@@ -85,6 +116,45 @@ spring:
 
 # ==================== 应用自定义配置 ====================
 purify:
+  # ---------------- 登录 / 注册 / 权限 ----------------
+  # 这里只放「该填什么」；凡是密钥一律留空，真实值写进 application-local.yml
+  # （被 .gitignore 的 *.local.yml 挡住）。
+  auth:
+    jwt:
+      # TODO 真实密钥写进 application-local.yml 的 purify.auth.jwt.secret
+      # 至少 32 个字符。留空会让应用**启动即失败**，这是有意的：
+      # 换成「空就随机生成一个」的话，每次重启所有人被登出，
+      # 而且配置没填这件事会被完全藏起来，等发现时已经不知道查哪儿了。
+      # 生成一个够用的：openssl rand -base64 48
+      secret: ""
+      # 令牌有效期。7 天：这是个演示项目，频繁掉线比多几分被盗风险更烦人。
+      # 注意有效期内**没有服务端吊销**（退出只是前端把令牌丢掉），
+      # 想收紧就改小这个值——改密码不会让旧令牌失效，这是最容易被注意到的那种情况
+      expire-minutes: 10080
+    mail:
+      # TODO 配好 application-local.yml 里的 spring.mail.* 之后改成 true
+      # false 时验证码不会真的发出去，只往日志里打一条 WARN（含验证码本身），
+      # 这样本地没配邮箱也能把注册流程走通。**绝不要把验证码放进接口响应**——
+      # 那等于把爆破的材料直接递给攻击者，而且会留在浏览器 devtools 和访问日志里
+      enabled: false
+      # TODO 发件人地址，通常和 spring.mail.username 填同一个
+      from: ""
+    code:
+      # 位数。6 位 = 100 万种，配合下面的限流和尝试上限才够用
+      length: 6
+      # 有效期。太长（比如 30 分钟）等于给爆破留时间窗
+      ttl-minutes: 10
+      # 重发间隔。按 (邮箱, 用途) 算，剩余秒数会写进错误消息给前端做倒计时
+      resend-seconds: 60
+      # 同一条验证码最多被试错几次，超了直接作废。
+      # 没有它的话，10 分钟内 100 万种可以被脚本跑完，前面两条限流形同虚设
+      max-attempts: 5
+    # 种子超级用户。每次启动都会按这里的口令重置它，理由见 RootAgentInitializer
+    root-agent:
+      username: root_agent
+      # TODO 仓库里的明文引导口令。上线前务必挪进 application-local.yml
+      password: 2568896k
+
   sensitive-word:
     enabled: true
     # 命中任意一个词就直接拦截，不会发起模型调用

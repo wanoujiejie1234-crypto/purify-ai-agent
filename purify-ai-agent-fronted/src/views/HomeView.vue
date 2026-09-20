@@ -1,5 +1,8 @@
 <script setup>
+import { computed } from 'vue'
 import AppIcon from '../components/AppIcon.vue'
+import UserMenu from '../components/UserMenu.vue'
+import * as auth from '../auth.js'
 import { SLIM, MANUS } from '../chatConfig.js'
 
 /**
@@ -10,7 +13,12 @@ import { SLIM, MANUS } from '../chatConfig.js'
  *
  * 标题是**纯色**不是渐变。这一点是有意的：渐变标题（尤其是青绿→紫那一挂）
  * 是最快让人看出「AI 生成的落地页」的一招，也是这次要拆掉的东西。
+ *
+ * 未登录的访客也能看到这一页（它是公开的），但页面上所有需要登录的入口
+ * 点下去都会跳登录页——那是路由守卫做的，这里只负责不把走不通的入口画出来。
  */
+
+const isAdmin = computed(() => auth.isAdmin())
 
 /**
  * 次级入口，占官网「API 开放平台」那一块的位置。
@@ -18,6 +26,10 @@ import { SLIM, MANUS } from '../chatConfig.js'
  * 每张卡只在自己的图标底上用它那条链路的主题色（--ca）。
  * 那个色块的作用是「提醒你这条链路在聊天页里是什么颜色」，不是拿来做整页配色的 ——
  * 页面的主色调始终是蓝的。
+ *
+ * 知识库那张卡用 `adminOnly` 标出来，在模板里按角色过滤掉。
+ * **这只是界面显隐**，真正的拦截在后端的 `@RequireAdmin`：手工改一下
+ * localStorage 就能让这张卡冒出来，但点进去每个接口都返回 403。
  */
 const entries = [
   {
@@ -35,8 +47,17 @@ const entries = [
     accent: SLIM.accent,
     desc: '上传文档建索引，看每份文档切成了几片，再用一句话试着检索一次 —— 对话里查的就是它。',
     meta: '文档索引 · 向量检索 · 检索自检',
+    adminOnly: true,
   },
 ]
+
+/**
+ * 实际渲染出来的入口卡。
+ *
+ * 普通用户只剩一张卡，网格要从两列变成一列——不然会留一个空洞，
+ * 看起来像有一张卡加载失败了（那是 `entries` 的网格类名要做的事，见模板）。
+ */
+const visibleEntries = computed(() => entries.filter((e) => !e.adminOnly || isAdmin.value))
 
 /**
  * 光标走到哪，那一片点阵就亮成蓝色。
@@ -72,7 +93,10 @@ function trackPointer(e) {
 
       <nav class="nav-side">
         <RouterLink to="/manus">PurifyManus</RouterLink>
-        <RouterLink to="/knowledge">知识库</RouterLink>
+        <!-- 知识库只对超级用户显示。未登录的访客也不该看到它：
+             点进去先被守卫拦到登录页，登录完发现还是没有权限，白跑一趟 -->
+        <RouterLink v-if="isAdmin" to="/knowledge">知识库</RouterLink>
+        <UserMenu />
       </nav>
     </header>
 
@@ -100,11 +124,13 @@ function trackPointer(e) {
       </p>
     </main>
 
-    <section class="entries" aria-label="其他入口">
+    <!-- 只剩一张卡时网格改成单列：两列的话右边会空一格，
+         看起来像另一张卡没加载出来 -->
+    <section class="entries" :class="{ single: visibleEntries.length === 1 }" aria-label="其他入口">
       <!-- 整张卡片是 RouterLink，渲染成 <a>，所以键盘 Enter 天然可用，
            不需要额外补 tabindex 和 keydown -->
       <RouterLink
-        v-for="(e, i) in entries"
+        v-for="(e, i) in visibleEntries"
         :key="e.to"
         class="entry enter"
         :to="e.to"
@@ -129,7 +155,9 @@ function trackPointer(e) {
             <RouterLink to="/manus">PurifyManus</RouterLink>
           </div>
 
-          <div class="col">
+          <!-- 这一栏只对超级用户有意义：里面两个链接都指向同一个需要管理员权限的页面。
+               对其他人显示它，等于在页脚放两个点进去就 403 的链接 -->
+          <div v-if="isAdmin" class="col">
             <h3>知识库</h3>
             <RouterLink to="/knowledge">文档管理</RouterLink>
             <RouterLink to="/knowledge">检索自检</RouterLink>
@@ -392,6 +420,12 @@ function trackPointer(e) {
   padding-inline: clamp(20px, 5vw, 52px);
 }
 
+/* 只剩「PurifyManus」一张卡时（普通用户看不到知识库那张）。
+   保持两列的话右边会空一格，看起来像另一张卡加载失败 */
+.entries.single {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .entry {
   position: relative;
   display: flex;
@@ -491,7 +525,9 @@ function trackPointer(e) {
 
 .foot-cols {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  /* auto-fit 而不是写死三列：知识库那一栏只对超级用户显示，
+     普通用户只剩两栏，写死三列会在右边留一块空白 */
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
   gap: 30px;
   padding-bottom: clamp(30px, 5vh, 44px);
 }
@@ -569,8 +605,9 @@ function trackPointer(e) {
     grid-template-columns: minmax(0, 1fr);
     gap: 24px;
   }
-  /* 窄屏放不下两个次级链接，顶栏只留品牌标 —— 它们页脚里都有 */
-  .nav-side {
+  /* 窄屏放不下那几个次级链接，只藏掉它们 —— 它们页脚里都有。
+     但用户菜单必须留着：那是移动端唯一的登录/退出入口 */
+  .nav-side > a {
     display: none;
   }
 }

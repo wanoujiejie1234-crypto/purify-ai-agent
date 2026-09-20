@@ -2,9 +2,13 @@ package com.purify.purifyaiagent.controller;
 
 import com.purify.purifyaiagent.agent.AgentEvent;
 import com.purify.purifyaiagent.agent.PurifyManus;
+import com.purify.purifyaiagent.auth.CurrentUser;
+import com.purify.purifyaiagent.auth.LoginUser;
+import com.purify.purifyaiagent.auth.RequireLogin;
 import com.purify.purifyaiagent.chat.ChatEntry;
 import com.purify.purifyaiagent.chat.ChatRecordRepository;
 import com.purify.purifyaiagent.chat.ChatSessionRepository;
+import com.purify.purifyaiagent.chat.SessionAccess;
 import com.purify.purifyaiagent.model.ChatHistoryItem;
 import com.purify.purifyaiagent.model.ChatRequest;
 import lombok.extern.slf4j.Slf4j;
@@ -14,7 +18,6 @@ import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -46,6 +49,7 @@ import java.util.List;
 @Slf4j
 @RestController
 @RequestMapping("/api/manus")
+@RequireLogin
 public class PurifyManusController {
 
     private final PurifyManus manus;
@@ -74,19 +78,23 @@ public class PurifyManusController {
     @PostMapping(value = "/chat", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public ResponseEntity<Flux<ServerSentEvent<AgentEvent>>> chat(
             @RequestBody ChatRequest request,
-            @RequestHeader(value = SessionController.USER_ID_HEADER, required = false) String userId) {
+            @CurrentUser LoginUser me) {
         String message = request.requireMessage();
         String id = resolveChatId(request.chatId());
-        log.info("[manus] chat 请求 chatId={} message={}", id, message);
+        log.info("[manus] chat 请求 chatId={} user={} message={}", id, me.describe(), message);
+
+        // 归属校验必须在 touch 之前，理由同 SlimAppController。
+        // 智能体这条链路被插一脚的后果更直接：它会打断或混进别人正在跑的那次 run
+        SessionAccess.requireCanWrite(chatSessionRepository, id, me.id());
 
         // 会话行在这里建/续期，理由同 SlimAppController：只有 HTTP 这层知道用户是谁。
         // 标题只在首次插入时写入，用户改过的名字不会被下一句话冲掉
-        chatSessionRepository.touch(id, SessionController.resolveUserId(userId), ChatEntry.MANUS, message);
+        chatSessionRepository.touch(id, me.id(), ChatEntry.MANUS, message);
 
         // 智能体自己会把模型和工具的错误转成 ERROR 事件；能走到这里的只有传输层的意外
         // （客户端断开、编码失败）。留一条兜底，免得用户看到一个没有事件、也没有结尾的流，
         // 分不清是还在跑还是已经断了
-        Flux<AgentEvent> events = manus.chatStream(id, message)
+        Flux<AgentEvent> events = manus.chatStream(id, me.id(), message)
                 .onErrorResume(error -> {
                     log.error("[manus] 流式对话失败 chatId={}", id, error);
                     return Flux.just(AgentEvent.error("服务暂时出了点问题，请稍后再试。"));
@@ -101,15 +109,19 @@ public class PurifyManusController {
      * <p>每条记录带着它的收尾状态和步数：前端据此可以把「它当时问了你一个问题」
      * 和「它答完了」两种轮次画成不同的样子——这是智能体这条链路独有的信息。
      *
-     * <p>会话不存在或还没聊过时返回空数组，这是正常结果，不是错误。
+     * <p><b>会话不存在、或者不属于调用方时返回 404</b>，两者是同一个响应——口径和
+     * {@code SlimAppController#history} 完全一致（那边写了为什么这样设计），
+     * 判定也走同一个 {@link SessionAccess}，免得两条链路哪天漂移成两套行为。
      */
     @GetMapping("/history")
-    public List<ChatHistoryItem> history(@RequestParam String chatId) {
+    public List<ChatHistoryItem> history(@RequestParam String chatId, @CurrentUser LoginUser me) {
+        SessionAccess.requireOwned(chatSessionRepository, chatId, me.id());
+
         List<ChatHistoryItem> items = chatRecordRepository.findByConversation(chatId, ChatEntry.MANUS.scenes())
                 .stream()
                 .map(ChatHistoryItem::from)
                 .toList();
-        log.info("[manus] 读取历史 chatId={} 共 {} 条", chatId, items.size());
+        log.info("[manus] 读取历史 chatId={} user={} 共 {} 条", chatId, me.describe(), items.size());
         return items;
     }
 

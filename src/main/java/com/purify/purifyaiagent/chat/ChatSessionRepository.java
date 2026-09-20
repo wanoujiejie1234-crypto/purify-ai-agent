@@ -9,6 +9,7 @@ import org.springframework.util.StringUtils;
 import java.sql.Timestamp;
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * 会话列表的读写：侧边栏的那一份数据。
@@ -99,6 +100,25 @@ public class ChatSessionRepository {
     /** 某个用户在某个入口下的全部会话，按最近使用倒序。 */
     public List<ChatSessionItem> list(String userId, ChatEntry entry) {
         return jdbcTemplate.query(SELECT_SQL, ROW_MAPPER, userId, entry.name());
+    }
+
+    /**
+     * 这个会话属于谁。会话不存在返回 {@link Optional#empty()}。
+     *
+     * <p>聊天记录那边（{@code chat_record}）没有 {@code user_id} 列，也不该有——
+     * 「这个会话属于谁」是每个会话一份的属性，塞进按行存的账本里就得在每一行上重复一遍。
+     * 所以所有归属判断都走这张表，这也是它的建表脚本里写明的分工。
+     *
+     * <p><b>调用方必须把「查不到」和「查到但不是你」当成同一个结果</b>（都是 404）。
+     * 分开处理的话，响应就成了一个存在性探测口子：能靠状态码的差异问出
+     * 「这个 chatId 是不是真的存在」。{@code SessionController#rename}
+     * 和 {@link #rename} 已经是这个口径了，归属校验要和它们一致。
+     */
+    public Optional<String> ownerOf(String conversationId) {
+        List<String> found = jdbcTemplate.query(
+                "SELECT user_id FROM chat_session WHERE conversation_id = ?",
+                (resultSet, rowNum) -> resultSet.getString("user_id"), conversationId);
+        return found.isEmpty() ? Optional.empty() : Optional.of(found.get(0));
     }
 
     /**

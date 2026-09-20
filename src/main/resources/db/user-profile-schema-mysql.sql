@@ -11,9 +11,19 @@
 --
 -- 由 Spring Boot 的 spring.sql.init 在启动时执行（见 application.yml 的 spring.sql.init）。
 -- 因此每条语句都必须幂等：重复启动不能报错，更不能清掉已有数据，所以全部带 IF NOT EXISTS。
+--
+-- user_id 存的是 user.id 的十进制字符串（接入登录之前存的是浏览器生成的会话 UUID）。
+-- 列类型保持 VARCHAR(64) 没有改：这张表在共享的 dev 库里已经建好、已经有数据了，
+-- 而 MySQL 8 没有 MODIFY COLUMN IF ...，改类型要走 Java 侧的守卫，收益为零。
+-- 19 位数字放进 64 个字符绰绰有余。
+--
+-- 登录之前那些按 UUID / "anonymous" 存的行从此读不到了（不会再有人用那个 key 来查），
+-- 但一条都没删。要清的话自己执行（**不要**放进自动脚本，不可逆）：
+--   DELETE FROM user_profile WHERE user_id NOT REGEXP '^[0-9]+$';
+--   DELETE FROM user_profile_weight_history WHERE user_id NOT REGEXP '^[0-9]+$';
 CREATE TABLE IF NOT EXISTS user_profile
 (
-    user_id         VARCHAR(64)  NOT NULL COMMENT '用户标识，当前用会话 ID，见 UserProfileTool 的说明',
+    user_id         VARCHAR(64)  NOT NULL COMMENT '用户标识：user.id 的十进制字符串',
     age             INT          NULL COMMENT '年龄（岁）',
     height_cm       DECIMAL(5,1) NULL COMMENT '身高（厘米）',
     weight_kg       DECIMAL(5,1) NULL COMMENT '当前体重（公斤）',

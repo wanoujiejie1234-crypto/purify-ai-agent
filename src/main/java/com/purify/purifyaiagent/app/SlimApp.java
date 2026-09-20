@@ -27,6 +27,7 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.core.io.Resource;
 import org.springframework.stereotype.Component;
 import org.springframework.util.MimeType;
+import org.springframework.util.StringUtils;
 import reactor.core.publisher.Flux;
 
 import java.time.LocalDate;
@@ -223,21 +224,24 @@ public class SlimApp {
      *
      * @param message 用户输入
      * @param chatId  会话 ID，相同 ID 共享历史记录
+     * @param userId  发起这次对话的用户 id。它和 {@code chatId} <b>都是不透明的字符串，
+     *                写反了能编译通过</b>，而表现是用户画像被存到了会话 id 上——
+     *                所有入口都要保持 {@code (message, chatId, userId)} 这个顺序
      */
-    public String chat(String message, String chatId) {
+    public String chat(String message, String chatId, String userId) {
         String reply = chatClient.prompt()
                 .system(renderSystemPrompt())
                 .user(message)
                 .advisors(spec -> spec.param(ChatMemory.CONVERSATION_ID, chatId))
-                .toolContext(toolContext(chatId))
+                .toolContext(toolContext(userId))
                 .call()
                 .content();
         record(chatId, ChatScene.SLIM, message, reply);
         return reply;
     }
 
-    /** 多轮对话（流式），返回逐段生成的文本。 */
-    public Flux<String> chatStream(String message, String chatId) {
+    /** 多轮对话（流式），返回逐段生成的文本。参数顺序同 {@link #chat}。 */
+    public Flux<String> chatStream(String message, String chatId, String userId) {
         // 流式拿不到一个「最终的字符串」，只能自己把分片攒起来；
         // 攒的动作和 LoggingAdvisor 汇总日志是同一个套路
         StringBuilder reply = new StringBuilder();
@@ -245,7 +249,7 @@ public class SlimApp {
                 .system(renderSystemPrompt())
                 .user(message)
                 .advisors(spec -> spec.param(ChatMemory.CONVERSATION_ID, chatId))
-                .toolContext(toolContext(chatId))
+                .toolContext(toolContext(userId))
                 .stream()
                 .content()
                 .doOnNext(reply::append)
@@ -269,8 +273,9 @@ public class SlimApp {
      * @param image    图片资源，交给模型前会整体读成字节
      * @param mimeType 图片 MIME 类型，决定模型按什么格式解码
      * @param chatId   会话 ID
+     * @param userId   发起这次对话的用户 id，参数顺序同 {@link #chat}
      */
-    public String explainImage(String question, Resource image, MimeType mimeType, String chatId) {
+    public String explainImage(String question, Resource image, MimeType mimeType, String chatId, String userId) {
         String ask = (question == null || question.isBlank()) ? DEFAULT_IMAGE_QUESTION : question;
         String userText = promptTemplateLoader.render(IMAGE_EXPLAIN_TEMPLATE, Map.of("question", ask));
 
@@ -278,7 +283,7 @@ public class SlimApp {
                 .system(promptTemplateLoader.render(VISION_SYSTEM_TEMPLATE, Map.of()))
                 .user(spec -> spec.text(userText).media(mimeType, image))
                 .advisors(spec -> spec.param(ChatMemory.CONVERSATION_ID, chatId))
-                .toolContext(toolContext(chatId))
+                .toolContext(toolContext(userId))
                 .call()
                 .content();
         // 记的是 ask（用户没提问时那句默认问题），不是模板渲染后的正文——
@@ -333,10 +338,19 @@ public class SlimApp {
      * {@code IllegalArgumentException: ToolContext is required by the method as an argument}——
      * 也就是说漏掉这一行不是「画像读不到」，而是整个对话直接失败。
      *
-     * <p>目前用会话 ID 当用户标识（这个项目还没有登录体系）。客户端复用同一个 chatId
-     * 就能跨轮次记住画像；将来接入登录后，这里换成真实用户 ID 即可，工具本身不用动。
+     * <p>传进来的是<b>真实用户 id</b>（由 HTTP 层从令牌里解出，见 {@code SlimAppController}）。
+     * 在这之前它用的是会话 ID，代价是「换个会话就等于换了个人」——同一个用户在轻语里说过的
+     * 身高体重，新开一个会话就查不到了。
+     *
+     * <p>user id 为空时返回空 map 而不是塞一个 null 进去：{@code Map.of} 遇到 null 会直接抛
+     * {@code NullPointerException}，而 {@code ToolContext} 的底层实现也可能对内容做
+     * 防御性拷贝。留键缺失是安全的——{@code UserProfileTool} 能处理这种情况，
+     * 会回一句「暂时记不住这些信息」让模型转告用户，对话本身不中断。
+     * 正常链路上走不到（聊天接口都要求登录），这是防「万一」的。
      */
-    private static Map<String, Object> toolContext(String chatId) {
-        return Map.of(UserProfileTool.USER_ID_KEY, chatId);
+    private static Map<String, Object> toolContext(String userId) {
+        return StringUtils.hasText(userId)
+                ? Map.of(UserProfileTool.USER_ID_KEY, userId)
+                : Map.of();
     }
 }

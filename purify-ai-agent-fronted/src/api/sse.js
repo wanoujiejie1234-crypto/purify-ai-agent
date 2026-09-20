@@ -16,7 +16,7 @@
  * 3. 必须用 TextDecoder 并带 { stream: true }。见下方注释。
  */
 
-import { currentUserId } from '../user.js'
+import * as auth from '../auth.js'
 
 /**
  * 发起一次流式请求。
@@ -30,16 +30,25 @@ import { currentUserId } from '../user.js'
  * @param {(id: string) => void} [opts.onChatId] 读到 X-Chat-Id 时回调
  */
 export async function streamChat({ url, chatId, message, signal, onEvent, onChatId }) {
+  const currentToken = auth.token()
+  const headers = {
+    'Content-Type': 'application/json',
+    Accept: 'text/event-stream',
+  }
+  // 这条链路绕过了 axios，所以 http.js 里那个带令牌的拦截器管不到它，
+  // 令牌必须在这里单独加一次。漏了的表现是发消息直接 401。
+  //
+  // 判空不能省：没有令牌时拼出来的是字符串 "Bearer null"，它**不是**一个空头——
+  // 后端的 extractToken 会把它当成一个真的令牌往下传，最后以「签名不对」告终。
+  // 结果虽然也是 401（正好是想要的），但日志里留下的是一个像模像样的伪造令牌，
+  // 排查时会误导方向。http.js 那边就是这么判的，两边保持一致
+  if (currentToken) {
+    headers.Authorization = `Bearer ${currentToken}`
+  }
+
   const resp = await fetch(url, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'text/event-stream',
-      // 这条链路绕过了 axios，所以 http.js 里那个带上用户标识的拦截器管不到它。
-      // 少了这一行，对话内容记进 chat_record 没错，但会话行会落到 anonymous 名下，
-      // 侧边栏因此永远看不到自己刚聊过的这一段
-      'X-User-Id': currentUserId(),
-    },
+    headers,
     body: JSON.stringify({ chatId, message }),
     signal,
   })
@@ -49,7 +58,17 @@ export async function streamChat({ url, chatId, message, signal, onEvent, onChat
   const headerChatId = resp.headers.get('X-Chat-Id')
   if (headerChatId && onChatId) onChatId(headerChatId)
 
+  // 401 单独处理：令牌过期了，和 http.js 那条链路的动作要一致（清本地、去登录页）。
+  // 它发生在任何字节流出之前，所以不会有半截回答丢掉的问题
+  if (resp.status === 401) {
+    auth.clear()
+    const here = window.location.pathname + window.location.search
+    window.location.assign(`/login?redirect=${encodeURIComponent(here)}`)
+    throw new Error(await readErrorMessage(resp))
+  }
+
   if (!resp.ok) {
+    // 404 也走这里：会话不存在或不属于自己。后端那句话已经写好了，直接显示
     throw new Error(await readErrorMessage(resp))
   }
   if (!resp.body) {

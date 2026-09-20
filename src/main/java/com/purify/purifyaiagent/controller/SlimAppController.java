@@ -2,9 +2,13 @@ package com.purify.purifyaiagent.controller;
 
 import com.purify.purifyaiagent.agent.AgentEvent;
 import com.purify.purifyaiagent.app.SlimApp;
+import com.purify.purifyaiagent.auth.CurrentUser;
+import com.purify.purifyaiagent.auth.LoginUser;
+import com.purify.purifyaiagent.auth.RequireLogin;
 import com.purify.purifyaiagent.chat.ChatEntry;
 import com.purify.purifyaiagent.chat.ChatRecordRepository;
 import com.purify.purifyaiagent.chat.ChatSessionRepository;
+import com.purify.purifyaiagent.chat.SessionAccess;
 import com.purify.purifyaiagent.exception.ApiException;
 import com.purify.purifyaiagent.exception.SensitiveWordException;
 import com.purify.purifyaiagent.model.ChatHistoryItem;
@@ -20,7 +24,6 @@ import org.springframework.util.MimeTypeUtils;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -47,10 +50,16 @@ import java.util.List;
  * <p>会话 ID 放在响应头 {@code X-Chat-Id} 里，客户端不传 {@code chatId} 时由服务端生成。
  * 注意跨域调用时浏览器默认读不到这个头，需要在 CORS 里放行它（{@code Access-Control-Expose-Headers}）；
  * 前端如果用同源的开发代理，就没有这个问题。
+ *
+ * <p><b>三个接口都要求登录，而且都会检查会话归属</b>（{@link SessionAccess}）。
+ * 这一层的必要性不只是「别看到别人的历史」：{@code touch()} 不会改写 {@code user_id}，
+ * 所以往别人的 chatId 发消息不会劫持那个会话——但那一轮会写进<b>那个会话的记忆里</b>，
+ * 而记忆正是模型下一轮要看的东西。少了这个检查，任何人都能往别人的对话里注入内容。
  */
 @Slf4j
 @RestController
 @RequestMapping("/api/slim")
+@RequireLogin
 public class SlimAppController {
 
     private final SlimApp slimApp;
@@ -78,19 +87,23 @@ public class SlimAppController {
     @PostMapping(value = "/chat", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public ResponseEntity<Flux<ServerSentEvent<AgentEvent>>> chat(
             @RequestBody ChatRequest request,
-            @RequestHeader(value = SessionController.USER_ID_HEADER, required = false) String userId) {
+            @CurrentUser LoginUser me) {
         String message = request.requireMessage();
         String id = resolveChatId(request.chatId());
-        log.info("[slim] chat 请求 chatId={} message={}", id, message);
+        log.info("[slim] chat 请求 chatId={} user={} message={}", id, me.describe(), message);
+
+        // 先判归属，再 touch：touch 会把会话建出来（如果是新的），
+        // 顺序反了的话「别人的会话」会被先建/续期一次才发现不该放行
+        SessionAccess.requireCanWrite(chatSessionRepository, id, me.id());
 
         // 会话行在这里建/续期，而不是在 SlimApp 里：那边没有 HTTP 请求，拿不到用户是谁。
         // 标题取用户这句话——但只有首次插入时才写，用户改过的名字不会被冲掉（见仓储的注释）
-        chatSessionRepository.touch(id, SessionController.resolveUserId(userId), ChatEntry.SLIM, message);
+        chatSessionRepository.touch(id, me.id(), ChatEntry.SLIM, message);
 
         // 流式没有一个「最终的字符串」可以事后取，只能一边推一边自己攒；攒的动作和
         // SlimApp 内部记聊天记录时是同一个套路
         StringBuilder full = new StringBuilder();
-        Flux<AgentEvent> events = slimApp.chatStream(message, id)
+        Flux<AgentEvent> events = slimApp.chatStream(message, id, me.id())
                 .doOnNext(full::append)
                 .map(AgentEvent::text)
                 // 必须包一层 defer：concatWith 的参数是在方法返回前就构造好的，
@@ -108,17 +121,22 @@ public class SlimAppController {
      * <p>只读 {@code chat_record} 这张账本表，不动对话记忆——记忆是喂给模型的，
      * 两者的用途不同，别把它们混在一起。
      *
-     * <p>会话不存在或还没聊过时返回空数组，这是正常结果，不是错误。
+     * <p><b>会话不存在、或者不属于调用方时返回 404</b>，两者是同一个响应、同一句话——
+     * 分开处理的话这个接口就成了一个存在性探测器。这里和以前的行为不同：
+     * 以前不存在的 chatId 会返回空数组，而空数组和「伪造的 ID」不可区分。
+     * 前端要配合：新会话不要来拉历史（必然 404），从本地恢复的旧 ID 真 404 时提示一句再开新会话。
      */
     @GetMapping("/history")
-    public List<ChatHistoryItem> history(@RequestParam String chatId) {
+    public List<ChatHistoryItem> history(@RequestParam String chatId, @CurrentUser LoginUser me) {
+        SessionAccess.requireOwned(chatSessionRepository, chatId, me.id());
+
         // 入口到 scene 的映射收在 ChatEntry 里：它和侧边栏分栏用的是同一份规则，
         // 两处各写一遍的话，漂移的表现是「历史里少了一截」而不报任何错
         List<ChatHistoryItem> items = chatRecordRepository.findByConversation(chatId, ChatEntry.SLIM.scenes())
                 .stream()
                 .map(ChatHistoryItem::from)
                 .toList();
-        log.info("[slim] 读取历史 chatId={} 共 {} 条", chatId, items.size());
+        log.info("[slim] 读取历史 chatId={} user={} 共 {} 条", chatId, me.describe(), items.size());
         return items;
     }
 
@@ -141,19 +159,24 @@ public class SlimAppController {
     public ChatReply explainImage(@RequestParam("file") MultipartFile file,
                                   @RequestParam(required = false) String question,
                                   @RequestParam(required = false) String chatId,
-                                  @RequestHeader(value = SessionController.USER_ID_HEADER, required = false) String userId) {
+                                  @CurrentUser LoginUser me) {
         if (file == null || file.isEmpty()) {
             throw ApiException.invalidImage("请上传一张非空的图片文件");
         }
         String id = resolveChatId(chatId);
-        log.info("[explainImage] chatId={} filename={} size={}B contentType={}",
-                id, file.getOriginalFilename(), file.getSize(), file.getContentType());
+        log.info("[explainImage] chatId={} user={} filename={} size={}B contentType={}",
+                id, me.describe(), file.getOriginalFilename(), file.getSize(), file.getContentType());
+
+        // 看图也走归属校验：它和文本对话共用同一份会话记忆，
+        // 少了这一步，发一张图就能往别人的对话里塞内容
+        SessionAccess.requireCanWrite(chatSessionRepository, id, me.id());
 
         // 看图也是轻语的一段对话，同样要出现在侧边栏里。
         // 标题取这句提问；用户没写提问时仓储会兜成「新会话」——
         // 这里不替它编一句默认问题，那句话是给模型看的，不是用户说的
-        chatSessionRepository.touch(id, SessionController.resolveUserId(userId), ChatEntry.SLIM, question);
-        return new ChatReply(id, slimApp.explainImage(question, file.getResource(), resolveImageType(file), id));
+        chatSessionRepository.touch(id, me.id(), ChatEntry.SLIM, question);
+        return new ChatReply(id,
+                slimApp.explainImage(question, file.getResource(), resolveImageType(file), id, me.id()));
     }
 
     private String resolveChatId(String chatId) {

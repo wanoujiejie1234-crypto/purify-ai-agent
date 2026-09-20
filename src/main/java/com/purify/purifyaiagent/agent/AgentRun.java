@@ -25,6 +25,21 @@ import java.util.Set;
 public final class AgentRun {
 
     private final String chatId;
+
+    /**
+     * 发起这次 run 的用户 id（十进制字符串），由 HTTP 层从令牌里解出来。
+     *
+     * <p><b>为什么不复用 {@link #chatId}</b>：会话和人是两个维度。同一个用户可以有多个会话
+     * （每个都有自己的 chatId），而用户画像是<b>按人</b>存的——拿 chatId 当用户标识的话，
+     * 用户在「轻语」里说的身高体重，换个会话就查不到了。
+     *
+     * <p><b>为什么放在这里而不是 ThreadLocal 里</b>：run 的事件流跑在 Reactor 的调度线程上
+     * （见 {@code BaseAgent#runStream} 的 {@code subscribeOn}），请求线程上的 ThreadLocal
+     * 在那里不保证可见；而失败的表现是「画像悄悄存到了别人名下」。
+     * 这个类的类注释已经把规矩定死了：凡是会变的、跟着一次 run 走的状态都放这里。
+     */
+    private final String userId;
+
     private final List<Message> messages;
     private final List<AgentStep> steps = new ArrayList<>();
     private final List<String> hints = new ArrayList<>();
@@ -49,8 +64,9 @@ public final class AgentRun {
     private int loopHits = 0;
     private boolean streaming = false;
 
-    private AgentRun(String chatId, List<Message> history, String input) {
+    private AgentRun(String chatId, String userId, List<Message> history, String input) {
         this.chatId = chatId;
+        this.userId = userId;
         this.messages = new ArrayList<>(history);
         // 用户这句话先落进工作列表：万一下一步就崩了，记忆里也还留着这次提问
         this.messages.add(new UserMessage(input));
@@ -59,15 +75,29 @@ public final class AgentRun {
     /**
      * 开一次 run。
      *
+     * @param userId  发起这次 run 的用户 id，见 {@link #userId} 字段的说明。
+     *                为 null 或空白是允许的（工具层会退化成「认不出是谁」），
+     *                但 HTTP 入口在鉴权那一步就已经挡住了这种情况
      * @param history 这个会话已有的消息（来自 {@code AgentMemory}），会被拷进工作列表；
      *                外面那份不受影响——run 跑到一半失败时，记忆里保留的还是上一次完整的状态
      */
-    public static AgentRun start(String chatId, String input, List<Message> history) {
-        return new AgentRun(chatId, history, input);
+    public static AgentRun start(String chatId, String userId, String input, List<Message> history) {
+        return new AgentRun(chatId, userId, history, input);
     }
 
     public String chatId() {
         return chatId;
+    }
+
+    /**
+     * 发起这次 run 的用户 id。
+     *
+     * <p>注意它和 {@link #chatId()} <b>都是 String、且都是不透明的标识符</b>——
+     * 两个参数写反了能编译通过，表现却是「画像存到了会话 id 上」，
+     * 而且不会有任何报错。所有调用点要保持 {@code (chatId, userId, ...)} 这个顺序。
+     */
+    public String userId() {
+        return userId;
     }
 
     /** 正在拼装的工作消息列表（不含系统提示词）。每一步结束后由 {@code BaseAgent} 交给记忆保存。 */

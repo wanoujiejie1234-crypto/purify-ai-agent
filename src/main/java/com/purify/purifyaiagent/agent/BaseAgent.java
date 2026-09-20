@@ -69,9 +69,13 @@ public abstract class BaseAgent {
      *
      * <p>事件被丢掉了——阻塞式调用方要的是最终答复，中间过程在日志里。
      * 想看中间过程就用 {@link #runStream}。
+     *
+     * @param userId 发起这次 run 的用户 id。它和 {@code chatId} 都是不透明的字符串，
+     *               <b>写反了能编译通过</b>，而表现是用户画像被存到了会话 id 上——
+     *               所有调用点都要保持 {@code (chatId, userId, ...)} 这个顺序
      */
-    public AgentResult runBlocking(String chatId, String input) {
-        AgentRun run = newRun(chatId, input);
+    public AgentResult runBlocking(String chatId, String userId, String input) {
+        AgentRun run = newRun(chatId, userId, input);
         execute(run).then().block();
         AgentResult result = run.toResult();
         log.info("[{}] 会话 {} 跑完：state={} 共 {} 步，循环命中 {} 次，答复={}",
@@ -85,8 +89,8 @@ public abstract class BaseAgent {
      * <p>模型调用也因此走流式（见 {@code ToolCallAgent#think}）——否则「流式」只是把一次
      * 算完的结果分段发出去，用户该等多久还是等多久。
      */
-    public Flux<AgentEvent> runStream(String chatId, String input) {
-        AgentRun run = newRun(chatId, input);
+    public Flux<AgentEvent> runStream(String chatId, String userId, String input) {
+        AgentRun run = newRun(chatId, userId, input);
         run.setStreaming(true);
         return execute(run)
                 // 整个循环挪到弹性线程池上跑，而不是留在订阅它的那个线程上。
@@ -123,9 +127,9 @@ public abstract class BaseAgent {
      * 但看门狗升级出来的提问（{@code AskUserLoopHandler}）不是模型说的，历史里没有。
      * 补上这段开场白之后，两条来路在模型眼里就一样了。
      */
-    private AgentRun newRun(String chatId, String input) {
+    private AgentRun newRun(String chatId, String userId, String input) {
         String question = memory.takePendingQuestion(chatId);
-        return AgentRun.start(chatId, withQuestion(input, question), memory.get(chatId));
+        return AgentRun.start(chatId, userId, withQuestion(input, question), memory.get(chatId));
     }
 
     private static String withQuestion(String input, String question) {

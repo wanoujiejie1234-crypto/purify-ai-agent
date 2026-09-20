@@ -18,6 +18,15 @@ import java.util.Optional;
  *
  * <p>SQL 用到的表由 {@code spring.sql.init} 在启动时按
  * {@code db/user-profile-schema-mysql.sql} 建好，所以这里不做任何建表或存在性检查。
+ *
+ * <p><b>关于 {@code userId}</b>：它是 {@code user.id} 的十进制字符串形式
+ * （不是 {@code Long}）。表的 {@code user_id} 列是 {@code VARCHAR(64)}，
+ * 而它在接入登录之前就建好、还存着按浏览器 UUID 记的旧数据了——
+ * MySQL 8 没有 {@code MODIFY COLUMN IF ...}，改列类型要走 Java 侧的 schema 守卫，收益为零。
+ * 19 位的数字放进 64 字符里绰绰有余，而这个类本来就是按字符串比较的。
+ *
+ * <p>接入登录之前存下的那些行（key 是 UUID 或 {@code "anonymous"}）从此读不到了，
+ * 但一条都没删——清理 SQL 以注释形式放在建表脚本的头部，要不要执行由人决定。
  */
 @Slf4j
 public class UserProfileRepository {
