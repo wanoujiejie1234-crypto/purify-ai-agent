@@ -10,17 +10,20 @@ import com.purify.purifyaiagent.chat.ChatRecordRepository;
 import com.purify.purifyaiagent.chat.ChatSessionRepository;
 import com.purify.purifyaiagent.chat.SessionAccess;
 import com.purify.purifyaiagent.exception.ApiException;
+import com.purify.purifyaiagent.advisor.SensitiveWordChecker;
 import com.purify.purifyaiagent.exception.SensitiveWordException;
+import com.purify.purifyaiagent.i18n.MessageResolver;
+import com.purify.purifyaiagent.i18n.Messages;
+import com.purify.purifyaiagent.media.ImageTypes;
 import com.purify.purifyaiagent.model.ChatHistoryItem;
 import com.purify.purifyaiagent.model.ChatReply;
 import com.purify.purifyaiagent.model.ChatRequest;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.i18n.LocaleContextHolder;
 import org.springframework.http.MediaType;
-import org.springframework.http.MediaTypeFactory;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.util.MimeType;
-import org.springframework.util.MimeTypeUtils;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -65,13 +68,19 @@ public class SlimAppController {
     private final SlimApp slimApp;
     private final ChatRecordRepository chatRecordRepository;
     private final ChatSessionRepository chatSessionRepository;
+    private final MessageResolver messageResolver;
+    private final SensitiveWordChecker sensitiveWordChecker;
 
     public SlimAppController(SlimApp slimApp,
                              ChatRecordRepository chatRecordRepository,
-                             ChatSessionRepository chatSessionRepository) {
+                             ChatSessionRepository chatSessionRepository,
+                             MessageResolver messageResolver,
+                             SensitiveWordChecker sensitiveWordChecker) {
         this.slimApp = slimApp;
         this.chatRecordRepository = chatRecordRepository;
         this.chatSessionRepository = chatSessionRepository;
+        this.messageResolver = messageResolver;
+        this.sensitiveWordChecker = sensitiveWordChecker;
     }
 
     /**
@@ -103,14 +112,17 @@ public class SlimAppController {
         // 流式没有一个「最终的字符串」可以事后取，只能一边推一边自己攒；攒的动作和
         // SlimApp 内部记聊天记录时是同一个套路
         StringBuilder full = new StringBuilder();
-        Flux<AgentEvent> events = slimApp.chatStream(message, id, me.id())
+        // 语言在**请求线程上**取一次，然后沿着这条 Flux 传下去。
+        // 流里的算子和 onErrorResume 都跑在别的线程上，那时候 LocaleContextHolder 已经不准了
+        Messages i18n = messageResolver.current();
+        Flux<AgentEvent> events = slimApp.chatStream(message, id, me.id(), i18n)
                 .doOnNext(full::append)
                 .map(AgentEvent::text)
                 // 必须包一层 defer：concatWith 的参数是在方法返回前就构造好的，
                 // 直接写 AgentEvent.finished(full.toString()) 的话，那时候流还没跑，攒出来是空的
                 .concatWith(Flux.defer(() -> Flux.just(AgentEvent.finished(full.toString()))))
                 // 流式场景下异常发生在订阅之后，@RestControllerAdvice 拦不到，这里就地降级
-                .onErrorResume(error -> Flux.just(terminalEvent(error)));
+                .onErrorResume(error -> Flux.just(terminalEvent(error, i18n)));
 
         return SseEvents.response(id, events);
     }
@@ -161,7 +173,7 @@ public class SlimAppController {
                                   @RequestParam(required = false) String chatId,
                                   @CurrentUser LoginUser me) {
         if (file == null || file.isEmpty()) {
-            throw ApiException.invalidImage("请上传一张非空的图片文件");
+            throw ApiException.invalidImage("error.image.empty");
         }
         String id = resolveChatId(chatId);
         log.info("[explainImage] chatId={} user={} filename={} size={}B contentType={}",
@@ -176,7 +188,11 @@ public class SlimAppController {
         // 这里不替它编一句默认问题，那句话是给模型看的，不是用户说的
         chatSessionRepository.touch(id, me.id(), ChatEntry.SLIM, question);
         return new ChatReply(id,
-                slimApp.explainImage(question, file.getResource(), resolveImageType(file), id, me.id()));
+                slimApp.explainImage(question, file.getResource(), resolveImageType(file), id, me.id(),
+                        // 这条接口是阻塞式的、就跑在请求线程上，本来可以省掉这一次显式取值。
+                        // 照样写成显式的，是为了让「语言从哪来」在所有入口上都是同一个写法——
+                        // 哪天这条也改成流式，就不会只剩下这里还需要想起来去改
+                        messageResolver.current()));
     }
 
     private String resolveChatId(String chatId) {
@@ -186,29 +202,12 @@ public class SlimAppController {
     /**
      * 判定图片的 MIME 类型，顺便挡掉非图片的上传。
      *
-     * <p>优先用上传时带的 Content-Type——它比文件名后缀可靠，后缀是可以随便改的；
-     * 拿不到时才回退到按文件名推断。挡在入口的好处是：明显不是图片的请求
-     * 不会走到模型那一层，既不浪费 token，也不用让模型去猜一堆乱码字节。
+     * <p>实现搬到了 {@link ImageTypes}：头像上传要挡的东西一模一样，
+     * 两处各写一份迟早会走偏（比如一边放开了 webp、另一边没有），
+     * 而这种不一致不会有任何报错，只是某个入口突然传不上去。
      */
     private static MimeType resolveImageType(MultipartFile file) {
-        String contentType = file.getContentType();
-        MimeType mimeType;
-        try {
-            mimeType = (contentType == null || contentType.isBlank())
-                    ? MediaTypeFactory.getMediaType(file.getResource()).orElse(null)
-                    : MimeTypeUtils.parseMimeType(contentType);
-        } catch (IllegalArgumentException exception) {
-            // MimeTypeUtils 对畸形 Content-Type 抛的是 InvalidMimeTypeException
-            throw ApiException.invalidImage("无法解析的 Content-Type：" + contentType);
-        }
-
-        if (mimeType == null) {
-            throw ApiException.invalidImage("无法识别图片格式，请改用 png / jpg / webp 等常见格式");
-        }
-        if (!"image".equalsIgnoreCase(mimeType.getType())) {
-            throw ApiException.invalidImage("只支持上传图片，当前类型：" + mimeType);
-        }
-        return mimeType;
+        return ImageTypes.resolve(file);
     }
 
     /**
@@ -223,11 +222,15 @@ public class SlimAppController {
      * {@code blocked} 是在流式链路上兑现同一条口径：话术照常显示，但状态单开一档，
      * 界面仍然能把它和正常答完区分开。智能体那条链路用的是同一个状态。
      */
-    private static AgentEvent terminalEvent(Throwable error) {
+    private AgentEvent terminalEvent(Throwable error, Messages i18n) {
         if (error instanceof SensitiveWordException sensitiveWordException) {
-            return AgentEvent.blocked(sensitiveWordException.getReplyMessage());
+            // 话术在这里取，不在 Advisor 里取：异常是 Advisor 抛的，而那条链在流式用法下
+            // 跑在 Reactor 线程上，读 LocaleContextHolder 会静默回落成默认语言。
+            // 这里手里有请求线程上捕获好的 i18n，取到的语言是准的
+            return AgentEvent.blocked(
+                    sensitiveWordChecker.replyMessage(i18n.locale()));
         }
         log.error("流式对话失败", error);
-        return AgentEvent.error("抱歉，服务暂时出了点问题，请稍后再试。");
+        return AgentEvent.error(i18n.get("error.streamFailed"));
     }
 }

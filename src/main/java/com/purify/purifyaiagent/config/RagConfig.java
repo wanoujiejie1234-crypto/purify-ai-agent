@@ -58,9 +58,18 @@ public class RagConfig {
      *
      * <p>这里建的是「一路全库 + 每类一路」共 N+1 个检索器：它们只是同一个知识库配了
      * 不同的过滤条件，本身不发请求，真正发请求的是被选中的那一个。
+     *
+     * <p><b>Bean 名与 pgvector 链路那个刻意保持一致</b>（都叫
+     * {@code knowledgeBaseDocumentRetriever}），理由同下面的
+     * {@link #knowledgeBaseRetrievalAdvisor}：两条链路的装配条件在类级互斥，
+     * 容器里永远只有一个。起同一个名字之后，共用方 {@code RagCommonConfig} 就能
+     * <b>按名字注入</b>，不必再依赖「恰好只剩一个候选」这个隐式前提——
+     * 后者在 IDE 里会被报成「more than one bean of DocumentRetriever type」，
+     * 因为它不解析 {@code @ConditionalOnProperty}，看不出那两个 Bean 永远不会同时存在。
      */
     @Bean
-    public DocumentRetriever bailianDocumentRetriever(DashScopeApi ragDashScopeApi, RagProperties ragProperties) {
+    public DocumentRetriever knowledgeBaseDocumentRetriever(DashScopeApi ragDashScopeApi,
+                                                            RagProperties ragProperties) {
         // 名字为空的话检索接口会拿空名字去换 pipeline_id，只能拿到 404，
         // 报错信息远不如在这里直接说清楚
         Assert.hasText(ragProperties.getIndexName(),
@@ -96,10 +105,10 @@ public class RagConfig {
      */
     @Bean
     public KnowledgeBaseAdvisor knowledgeBaseRetrievalAdvisor(
-            DocumentRetriever bailianDocumentRetriever,
+            DocumentRetriever knowledgeBaseDocumentRetriever,
             RagProperties ragProperties,
             KnowledgeRouter knowledgeRouter) {
-        return new RoutingKnowledgeBaseAdvisor(bailianDocumentRetriever,
+        return new RoutingKnowledgeBaseAdvisor(knowledgeBaseDocumentRetriever,
                 RagPrompts.USER_TEXT_ADVISE,
                 ragProperties.isEnableReference(),
                 ragProperties.getOrder(),

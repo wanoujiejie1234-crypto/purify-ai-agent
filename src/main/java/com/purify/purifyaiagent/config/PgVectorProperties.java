@@ -7,6 +7,8 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
@@ -69,8 +71,8 @@ public class PgVectorProperties {
      * 主键类型，默认 {@code text} 而不是 pgvector 上游的 {@code uuid}。
      *
      * <p>理由是权限：{@code uuid} 类型会让 {@code PgVectorStore} 的自动建表
-     * 额外执行一次 {@code CREATE EXTENSION "uuid-ossp"}，而阿里云 RDS 的普通账号
-     * 未必有建扩展的权限。<b>改成 text 就少一个可能没权限的扩展</b>，
+     * 额外执行一次 {@code CREATE EXTENSION "uuid-ossp"}，而应用连库用的那个账号
+     * 未必有建扩展的权限（托管实例上更常见）。<b>改成 text 就少一个可能没权限的扩展</b>，
      * 代价仅仅是主键从 128 位变成变长字符串——本项目的数据量下没有区别。
      *
      * <p>可选值见 {@link PgVectorStore.PgIdType}。
@@ -107,7 +109,7 @@ public class PgVectorProperties {
      *
      * <p>默认开着是为了「零手工步骤」。但它会无条件执行
      * {@code CREATE EXTENSION IF NOT EXISTS vector} 和
-     * {@code CREATE EXTENSION IF NOT EXISTS hstore}——阿里云 RDS 上如果账号没有
+     * {@code CREATE EXTENSION IF NOT EXISTS hstore}——应用连库的账号如果没有
      * 建扩展的权限，这里会以 {@code permission denied to create extension "hstore"}
      * 让应用启动失败。此时把本项改成 false，手工执行
      * {@code db/pgvector-schema-postgresql.sql} 即可。
@@ -260,5 +262,201 @@ public class PgVectorProperties {
 
         /** 切片时保留分隔符，中文长句不会在标点处被切掉后语义断裂。 */
         private boolean keepSeparator = true;
+    }
+
+    // ==================== 关键词检索 ====================
+
+    /**
+     * 关键词检索那一路的参数 —— 流程图里「向量检索」旁边那条并行的支路。
+     *
+     * <p>它解决的是向量检索的固有短板：<b>专有名词</b>（「利拉鲁肽」这类低频词、新词、
+     * 缩写）在 embedding 空间里没有稳定的邻域，捞不到就是捞不到。这一路做的是
+     * 字面上的精确匹配，两者互补，最后由 RRF 融合（见 {@link Rrf}）。
+     *
+     * <p><b>注意它不是 BM25。</b>真正的 BM25 要 IDF 加权 + tf 饱和的打分，而 RRF 读的是
+     * <b>名次</b>不是分数，那份打分会在这里被整个丢掉。何况 PostgreSQL 这边提供真 BM25 的
+     * 只有 ParadeDB 的 pg_search，而它要求 Rust 二进制 + 特定 CPU/OS，
+     * 托管实例上基本不用想。所以这一路的定位是「带索引的布尔精确匹配」，
+     * 排序靠命中词数（见 {@code PgKeywordSearcher}）。
+     */
+    private Keyword keyword = new Keyword();
+
+    /** RRF（Reciprocal Rank Fusion）融合的参数。 */
+    private Rrf rrf = new Rrf();
+
+    @Data
+    public static class Keyword {
+
+        /** 总闸。关掉 = 一行退回纯向量检索。 */
+        private boolean enabled = true;
+
+        /**
+         * 探测不到 pg_bigm 时，是停用这一路，还是硬着头皮上。
+         *
+         * <p><b>默认 {@code true}（停用），这个默认值是有意的、别改。</b>
+         * 本方案的 SQL 只引用 PostgreSQL 核心操作符（{@code LIKE}、{@code length}、{@code ->>}），
+         * <b>不调用任何 pg_bigm 函数</b>——所以扩展没装时查询<b>不会报错</b>，
+         * 只会静默退化成全表扫描。那比报错危险得多：它是个看不见的隐藏成本，
+         * 而且这一路的召回质量无从判断。
+         *
+         * <p>所以启动时会主动探测（见 {@code PgKeywordSearcher}）。探不到时：
+         * 本项为 {@code true} → 停用这一路并打一条能照着做的 WARN；
+         * 本项为 {@code false} → 照常跑，但每次都全表扫，<b>只适合几千条以下的小库</b>。
+         */
+        private boolean requireExtension = true;
+
+        /**
+         * 「探不到」这个结论的有效期（秒）。过期后下次检索会重新探测。
+         *
+         * <p><b>可用是稳定的，不可用不是。</b>探到可用就一直用，不再重复查库；
+         * 探到不可用只认这么久，过期重探——因为判断依据（扩展、索引）全在数据库那边，
+         * 而人是会去修它的。
+         *
+         * <p>这条是被真实使用逼出来的：修好数据库之后应用仍固执地说「检测不到」，
+         * 一直说到重启为止，排查时看着就像「修了没用」。同样的问题用户踩过两轮。
+         *
+         * <p>负数或 0 表示不重探（退化成纯记忆化，即改动前的行为）。
+         */
+        private int probeRetrySeconds = 60;
+
+        /**
+         * 关键词索引名。<b>留空则按 {@code <table-name>_bigm_idx} 推导。</b>
+         *
+         * <p>留空是有意的默认：改 {@code table-name} 时索引名自动跟着变，不会漂移。
+         * 换用 pg_trgm 兜底时才需要显式填（那时索引名不一样）。
+         */
+        private String indexName = "";
+
+        /**
+         * 这一路召回多少条。
+         *
+         * <p>默认与 {@link PgVectorProperties#coarseTopK} 对齐：RRF 假设两路列表长度可比，
+         * 长短差太多会让名次分的权重暗中偏斜。
+         */
+        private int topK = 20;
+
+        /**
+         * 一个问题最多拆出几个检索词。
+         *
+         * <p>它同时是「一个问题的候选集最多能被撑多大」的上限，和 SQL 参数个数的上限
+         * （每个词在 SQL 里出现两次，见 {@code PgKeywordSearcher}）。
+         */
+        private int maxPatterns = 12;
+
+        /** 短于这个长度的段直接丢弃：1 个字组不成 2-gram。 */
+        private int minTermLength = 2;
+
+        /**
+         * 长于这个长度的段不再整段作为一个检索词，只保留它的 2-gram。
+         *
+         * <p>没有词典就不知道词边界，超过这个长度的窗口大概率跨词（比如 15 字的
+         * 「高血压患者服用利拉鲁肽注意事项」），要求切片逐字出现这么长的一串，
+         * 命中率接近 0，纯属浪费名额。而它的 2-gram 里 {@code 血压} {@code 服用}
+         * {@code 鲁肽} 都是真词。
+         *
+         * <p>调大能覆盖更长的专业名词（如「二甲双胍缓释片」7 字），代价是更长的
+         * 短语更难被逐字命中。
+         */
+        private int maxTermLength = 6;
+
+        /**
+         * 要不要把每个段再拆成 2-gram。
+         *
+         * <p>关掉 = 只匹配整段短语（精度最高、召回最低）。候选集被撑爆时的第一根旋钮。
+         */
+        private boolean includeBigrams = true;
+
+        /**
+         * 停用词。它们在切段时被当作<b>切割点</b>（不是删掉），两侧的字不会跨段组合。
+         *
+         * <h2>选词的原则：宁可少切，不可错切</h2>
+         *
+         * <p>这两个方向的代价<b>严重不对称</b>：
+         * <ul>
+         *   <li><b>漏切</b>（该切的地方没切）——只是段变长了一点，而段内照样会展开 2-gram，
+         *       真正有用的词仍然能被召回。代价很小。</li>
+         *   <li><b>错切</b>（把词的一部分当成停用词切掉）——那个词<b>再也无法被整段匹配</b>，
+         *       而且切点两边都变成更短的碎片，可能连 2-gram 都组不出来。代价很大。</li>
+         * </ul>
+         *
+         * <p>所以单字停用词只收<b>几乎不可能出现在领域名词内部</b>的虚词。
+         * 下面这几个字是<b>刻意排除</b>的，它们每一个都会毁掉一个核心词：
+         * {@code 用 → 副作用}、{@code 能 → 能量}、{@code 有 → 有氧}、
+         * {@code 和 → 饱和}、{@code 不 → 不饱和脂肪酸}、{@code 应 → 不良反应}、
+         * {@code 可 → 可乐}、{@code 要 → 重要}、{@code 会 → 会话}、{@code 做 / 看 / 没}。
+         * <b>往这张表里加词之前，先把它在领域词汇里搜一遍。</b>
+         *
+         * <p>多字停用词没有这个问题（它们本身就是完整的词），所以「什么」「比较」
+         * 「一天」这些照收。
+         *
+         * <p>调它的时候用 {@code GET /api/rag/search?q=...} 看返回的 {@code keyword.terms}，
+         * 切得对不对一眼就能判断，不会报错。
+         */
+        private List<String> stopWords = new ArrayList<>(List.of(
+                // ---- 虚词：几乎只出现在句子骨架里，不会嵌在名词内部 ----
+                "的", "了", "是", "在", "吗", "呢", "吧", "啊", "呀",
+                "我", "你", "他", "她", "它", "这", "那",
+                "就", "都", "也", "还", "很", "太", "最", "更",
+                "请", "问", "把", "被", "让", "从", "之", "其",
+                "而", "但", "却", "则", "些", "等", "个",
+                // ---- 疑问词：问句里几乎必现，留着会把候选集撑爆 ----
+                "么", "什", "怎", "样", "哪", "多", "少",
+                "什么", "怎么", "怎样", "如何", "哪些", "多少", "是否", "有没有",
+                // ---- 领域停用词：在营养知识库里不携带信息，却会把名词粘成假词 ----
+                // 「吃」「喝」夹在中间会把「一天」和「鸡蛋」粘成一个查不到的假词「一天吃」；
+                // 「一天」「比较」同理。它们都是完整的词，不会嵌在名词内部，所以安全
+                "吃", "喝", "一天", "比较", "可以"));
+
+        /**
+         * 把检索词内联成 SQL 字面量，而不是走 {@code ?} 占位符。
+         *
+         * <p><b>逃生门，默认关着。</b>只有在实测发现参数化的 {@code LIKE ?} 让规划器
+         * 不肯走 GIN 索引时才打开——让它成为计划期常量。
+         *
+         * <p>内联是安全的：{@code KeywordTermExtractor} 在归一化阶段已经把所有
+         * 非「汉字 / 字母数字」的字符剥掉了，内联前还会再断言一次。
+         * 没有引号、没有反斜杠、没有通配符，构造不出注入。
+         */
+        private boolean inlinePatterns = false;
+
+        /**
+         * 实际使用的关键词索引名。
+         *
+         * @param tableName {@code purify.rag.pgvector.table-name}
+         */
+        public String effectiveIndexName(String tableName) {
+            return StringUtils.hasText(indexName) ? indexName : tableName + "_bigm_idx";
+        }
+    }
+
+    /**
+     * RRF 融合的参数。
+     *
+     * <p>RRF 的算法只有一行：{@code score(文档) = Σ 1 / (k + 名次)}，把几路召回结果按
+     * <b>名次</b>合成一个。用名次的理由很实在——两路的分数完全不可比（一个是余弦距离，
+     * 一个是命中词数），但「排第几」是可比的。
+     */
+    @Data
+    public static class Rrf {
+
+        /**
+         * 平滑常数，取原论文的 60。
+         *
+         * <p>它的作用是压平「第一名」和「第十名」的差距：两路各 20 条时，
+         * 分数落在 1/61 ≈ 0.0164 到 1/80 = 0.0125 这个很窄的区间里。
+         * 于是「两路都命中」几乎必然压过「单路第一」（2/80 = 0.025 > 1/61）——
+         * 这正是 RRF 想要的语义，别为了「拉开差距」把它调小。
+         */
+        private int k = 60;
+
+        /**
+         * 融合后交给重排的候选条数。
+         *
+         * <p><b>默认等于 {@link PgVectorProperties#coarseTopK}（20），这个默认值是有意的</b>：
+         * 交给重排的条数与加这一路之前<b>完全一样</b>，所以 RRF 不带来任何额外的
+         * 重排开销。调大它之前先看 {@code ragRerankModel} 的注释——
+         * 重排模型的 topN 必须跟着一起调，否则会被静默截断。
+         */
+        private int topK = 20;
     }
 }

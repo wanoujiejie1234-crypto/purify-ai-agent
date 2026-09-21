@@ -4,6 +4,7 @@ import AppIcon from '../components/AppIcon.vue'
 import UserMenu from '../components/UserMenu.vue'
 import * as auth from '../auth.js'
 import { SLIM, MANUS } from '../chatConfig.js'
+import { t } from '../i18n/index.js'
 
 /**
  * 主页是纯静态的应用入口，不请求任何后端接口 —— 后端没启动时也要能正常打开。
@@ -30,34 +31,62 @@ const isAdmin = computed(() => auth.isAdmin())
  * 知识库那张卡用 `adminOnly` 标出来，在模板里按角色过滤掉。
  * **这只是界面显隐**，真正的拦截在后端的 `@RequireAdmin`：手工改一下
  * localStorage 就能让这张卡冒出来，但点进去每个接口都返回 403。
+ *
+ * 顺序就是显示顺序：轻语排第一，它同时也是上面那颗主按钮指向的地方。
  */
-const entries = [
+/**
+ * 次级入口。
+ *
+ * **必须是 computed，不能是普通数组。** 这里每一项的 `name` / `desc` / `meta`
+ * 都是文案，而 `const entries = [...]` 是模块求值时算一次的：
+ * 用户在设置里切了语言，首页这几张卡片不会跟着变，刷新一下才对。
+ * 组件里的顶层 `const` 其实每次实例化都会重算一遍，但「切换语言时它得重算」
+ * 这件事依赖的是响应式，不是实例化时机——写成 computed 才是有保证的那一个。
+ *
+ * 链路名（轻语 / PurifyManus）现在是语言包里的，键名就是链路自己的 `link`。
+ */
+const entries = computed(() => [
+  {
+    to: '/slim',
+    name: t('chat.slim.title'),
+    icon: 'leaf',
+    accent: SLIM.accent,
+    desc: t('home.cardSlim'),
+    meta: t('home.cardSlimMeta'),
+  },
   {
     to: '/manus',
-    name: MANUS.title,
+    name: t('chat.manus.title'),
     icon: 'agent',
     accent: MANUS.accent,
-    desc: '能自己查资料、调工具、写文件，一步步把任务做完。信息不够时会停下来问你。',
-    meta: '工具调用 · MCP · 循环自检',
+    desc: t('home.cardManus'),
+    meta: t('home.cardManusMeta'),
   },
   {
     to: '/knowledge',
-    name: '知识库',
+    name: t('menu.knowledge'),
     icon: 'book',
     accent: SLIM.accent,
-    desc: '上传文档建索引，看每份文档切成了几片，再用一句话试着检索一次 —— 对话里查的就是它。',
-    meta: '文档索引 · 向量检索 · 检索自检',
+    desc: t('home.cardKnowledge'),
+    meta: t('home.cardKnowledgeMeta'),
     adminOnly: true,
   },
-]
+])
 
 /**
  * 实际渲染出来的入口卡。
  *
- * 普通用户只剩一张卡，网格要从两列变成一列——不然会留一个空洞，
- * 看起来像有一张卡加载失败了（那是 `entries` 的网格类名要做的事，见模板）。
+ * 未登录和普通用户是两张（轻语 + PurifyManus），超级用户多一张知识库。
  */
-const visibleEntries = computed(() => entries.filter((e) => !e.adminOnly || isAdmin.value))
+const visibleEntries = computed(() => entries.value.filter((e) => !e.adminOnly || isAdmin.value))
+
+/**
+ * 网格列数。
+ *
+ * 跟着实际渲染出来的卡片数走：写死两列的话，超级用户那三张会折行，
+ * 第三张孤零零地占半行，看起来像排版坏了。
+ */
+const gridClass = computed(() => `cols-${visibleEntries.value.length}`)
 
 /**
  * 光标走到哪，那一片点阵就亮成蓝色。
@@ -92,10 +121,10 @@ function trackPointer(e) {
       </RouterLink>
 
       <nav class="nav-side">
-        <RouterLink to="/manus">PurifyManus</RouterLink>
+        <RouterLink to="/manus">{{ $t('home.navManus') }}</RouterLink>
         <!-- 知识库只对超级用户显示。未登录的访客也不该看到它：
              点进去先被守卫拦到登录页，登录完发现还是没有权限，白跑一趟 -->
-        <RouterLink v-if="isAdmin" to="/knowledge">知识库</RouterLink>
+        <RouterLink v-if="isAdmin" to="/knowledge">{{ $t('home.navKnowledge') }}</RouterLink>
         <UserMenu />
       </nav>
     </header>
@@ -103,30 +132,29 @@ function trackPointer(e) {
     <main class="hero">
       <p class="chip enter" :style="{ '--d': '0ms' }">
         <span class="pip" aria-hidden="true"></span>
-        Spring AI 驱动 · 一条会聊天，一条会干活
+        {{ $t('home.chip') }}
       </p>
 
-      <h1 class="slogan enter" :style="{ '--d': '80ms' }">先查清楚，再回答</h1>
+      <h1 class="slogan enter" :style="{ '--d': '80ms' }">{{ $t('home.slogan') }}</h1>
 
       <p class="lede enter" :style="{ '--d': '160ms' }">
-        轻语答健康问题前会先翻一遍知识库，PurifyManus 动手前会先查资料。翻不到就说翻不到，不编。
+        {{ $t('home.lede') }}
       </p>
 
       <!-- 主按钮。官网那颗「开始对话」的位置，落在轻语上 ——
            一问一答，是三条链路里最好上手的那个 -->
       <RouterLink to="/slim" class="cta enter" :style="{ '--d': '240ms' }">
-        开始对话
+        {{ $t('home.cta') }}
         <span class="arrow" aria-hidden="true">→</span>
       </RouterLink>
 
       <p class="cta-note enter" :style="{ '--d': '300ms' }">
-        与轻语对话 · 健康瘦身顾问，回答前先查知识库
+        {{ $t('home.ctaNote') }}
       </p>
     </main>
 
-    <!-- 只剩一张卡时网格改成单列：两列的话右边会空一格，
-         看起来像另一张卡没加载出来 -->
-    <section class="entries" :class="{ single: visibleEntries.length === 1 }" aria-label="其他入口">
+    <!-- 列数由 gridClass 按卡片数给：两张时两列，三张时三列 -->
+    <section class="entries" :class="gridClass" :aria-label="$t('home.entries')">
       <!-- 整张卡片是 RouterLink，渲染成 <a>，所以键盘 Enter 天然可用，
            不需要额外补 tabindex 和 keydown -->
       <RouterLink
@@ -150,28 +178,28 @@ function trackPointer(e) {
       <div class="foot-inner">
         <div class="foot-cols">
           <div class="col">
-            <h3>对话链路</h3>
-            <RouterLink to="/slim">轻语</RouterLink>
-            <RouterLink to="/manus">PurifyManus</RouterLink>
+            <h3>{{ $t('home.footChat') }}</h3>
+            <RouterLink to="/slim">{{ $t('chat.slim.title') }}</RouterLink>
+            <RouterLink to="/manus">{{ $t('chat.manus.title') }}</RouterLink>
           </div>
 
           <!-- 这一栏只对超级用户有意义：里面两个链接都指向同一个需要管理员权限的页面。
                对其他人显示它，等于在页脚放两个点进去就 403 的链接 -->
           <div v-if="isAdmin" class="col">
-            <h3>知识库</h3>
-            <RouterLink to="/knowledge">文档管理</RouterLink>
-            <RouterLink to="/knowledge">检索自检</RouterLink>
+            <h3>{{ $t('home.footKnowledge') }}</h3>
+            <RouterLink to="/knowledge">{{ $t('home.footDocs') }}</RouterLink>
+            <RouterLink to="/knowledge">{{ $t('home.footSearch') }}</RouterLink>
           </div>
 
           <div class="col">
-            <h3>关于</h3>
-            <p>前端 Vue 3 + Vite，后端 Spring Boot + Spring AI，向量检索走 pgvector。</p>
+            <h3>{{ $t('home.footAbout') }}</h3>
+            <p>{{ $t('home.footAboutText') }}</p>
           </div>
         </div>
 
         <div class="foot-bar">
           <span>© 2026 Purify AI</span>
-          <span>本地部署 · 单端口 8080</span>
+          <span>{{ $t('home.footDeploy') }}</span>
         </div>
       </div>
     </footer>
@@ -256,7 +284,13 @@ function trackPointer(e) {
 
 .nav {
   position: relative;
-  z-index: 1;
+  /* z-index 必须比 .hero / .entries 高（那两个是 1）。
+     顶栏里的用户菜单是一个绝对定位的下拉，而「定位元素 + z-index」
+     会给 .nav 造一个层叠上下文——下拉自己那个 z-index: 40 只会在这个
+     上下文内部生效，出不去。两边都是 1 的话，DOM 靠后的 .hero 就压在
+     下拉上面：下拉本身是透明的所以看得见，但点上去全被 .hero 接走了，
+     表现是「菜单能打开，但点退出登录没有任何反应」 */
+  z-index: 3;
   display: flex;
   align-items: center;
   gap: 20px;
@@ -420,9 +454,14 @@ function trackPointer(e) {
   padding-inline: clamp(20px, 5vw, 52px);
 }
 
-/* 只剩「PurifyManus」一张卡时（普通用户看不到知识库那张）。
-   保持两列的话右边会空一格，看起来像另一张卡加载失败 */
-.entries.single {
+/* 超级用户多一张知识库，排三列。两列的话第三张会折行，
+   孤零零占半行，看起来像排版坏了 */
+.entries.cols-3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+/* 兜底：理论上到不了这里（轻语和 PurifyManus 两张是必有的） */
+.entries.cols-1 {
   grid-template-columns: minmax(0, 1fr);
 }
 

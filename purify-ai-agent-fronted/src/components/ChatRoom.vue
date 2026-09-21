@@ -1,31 +1,71 @@
 <script setup>
 import { ref, reactive, computed, nextTick, onMounted, onBeforeUnmount } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { fetchHistory, fetchSessions, renameSession, deleteSession } from '../api/http.js'
 import { streamChat } from '../api/sse.js'
 import { renderMarkdown } from '../markdown.js'
 import { SLIM, MANUS } from '../chatConfig.js'
+import { theme, enterChatPage, leaveChatPage } from '../theme.js'
+import { isEnglish, message, rawMessage, resolveMessage, t } from '../i18n/index.js'
 import UserMenu from './UserMenu.vue'
 
 /**
  * 轻语和 PurifyManus 共用的聊天室。
  *
  * 两条链路的交互（气泡方向、流式打字、停止、会话 id、历史回放、侧边栏）完全一致，
- * 差别只有四处：接口路径、主题色、要不要展示工具调用过程、欢迎语。
+ * 差别只有四处：接口路径、主题色、要不要展示工具调用过程、文案。
  * 所以做成一个组件、用 props 区分，而不是复制两份 —— 复制出来的两份迟早会走样。
  */
 const props = defineProps({
   /** 'slim' | 'manus'，同时决定接口路径 /api/{link}/chat 和会话列表的入口名 */
   link: { type: String, required: true },
-  title: { type: String, required: true },
   /** 主题色，用户气泡和高亮都用它 */
   accent: { type: String, required: true },
   /** 智能体链路：额外展示工具调用过程、区分 WAITING_FOR_USER / ABORTED */
   agent: { type: Boolean, default: false },
-  welcome: { type: String, required: true },
-  intro: { type: String, required: true },
-  examples: { type: Array, default: () => [] },
-  placeholder: { type: String, default: '' },
 })
+
+const { t: $t, tm, rt } = useI18n()
+
+/**
+ * 这一条链路的文案。
+ *
+ * **必须是 computed，而且必须逐个声明成顶层常量。**
+ *
+ * 一、不能写成 `const copy = { title: t(...) }`：`t()` 在**求值那一刻**取当前语言，
+ * 这样写出来的对象会冻在初始语言里——表现是整页都英文了，只有欢迎语和示例问题
+ * 还是中文（而这几处恰恰是空会话时唯一可见的东西）。
+ *
+ * 二、不能写成 `const copy = { title: computed(...) }` 然后在模板里用 `copy.title`：
+ * 模板只对**顶层**的 ref 做自动解包，`copy` 是个普通对象，`copy.title` 拿到的是
+ * ref 本身而不是它的值，渲染出来会是 `[object Object]`。
+ *
+ * 键名就是 `link`，所以加一条链路不用动这个文件，加一组 `chat.<link>.*` 就行。
+ */
+const title = computed(() => t(`chat.${props.link}.title`))
+const welcome = computed(() => t(`chat.${props.link}.welcome`))
+const intro = computed(() => t(`chat.${props.link}.intro`))
+const placeholder = computed(() => t(`chat.${props.link}.placeholder`))
+// 数组要用 tm + rt 取。rt 在「消息已被编译成函数」的那套构建下才是必需的，
+// 在另一套构建下是恒等函数——两边都写一遍，就不用关心用的是哪种构建。
+// 不要写成 t('...examples[0]')：那靠的是路径解析器的下标语法，能work但不保证
+const examples = computed(() => tm(`chat.${props.link}.examples`).map((item) => rt(item)))
+
+/* -------------------------------------------------------------------- 主题 */
+
+/**
+ * 深色开关。
+ *
+ * 这里**在 setup 里同步调** `enterChatPage()`，而不是放到 onMounted：
+ * mounted 的时候首帧已经画完了，深色用户每次刷新都会先闪一下浅色。
+ * setup 跑在组件第一次渲染之前，正好。
+ *
+ * 离开时必须摘掉（onBeforeUnmount），否则用户从对话页回到首页，
+ * 首页会顶着一个 `theme-dark` 的类——而首页并没有深色样式。
+ */
+enterChatPage()
+
+const dark = computed(() => theme.value === 'dark')
 
 /* ------------------------------------------------------------------ 会话 id */
 
@@ -92,21 +132,40 @@ function onMediaChange(event) {
  */
 const otherLink = computed(() => (props.link === SLIM.link ? MANUS : SLIM))
 
+/** 另一条链路的显示名。它跟着语言走，所以标题也得在这儿翻一次（理由同上） */
+const otherLinkTitle = computed(() => t(`chat.${otherLink.value.link}.title`))
+
 /* ------------------------------------------------------------------- 状态 */
 
 const messages = ref([])
 const input = ref('')
 const streaming = ref(false)
-const historyError = ref('')
+/**
+ * 历史拉取失败的提示。**存描述符不存句子**（见 i18n/index.js 的 message()）：
+ * 存句子的话，中文时拉一次失败、再切到英文，那句提示会一直是中文，
+ * 而它恰恰是用户此刻唯一看得见的东西。
+ */
+const historyError = ref(null)
+
 
 let controller = null
 let uid = 0
 const nextId = () => `m${++uid}`
 
+/**
+ * 把两个「存描述符的 ref」翻成给模板看的句子。
+ *
+ * 写成 computed 而不是在模板里现调 `resolveMessage`：模板里那两处都有 `v-if`，
+ * 现调会让「有没有提示」和「提示是什么」是两次求值，中间万一变了会闪。
+ * 顺带也把 `v-if` 的判据统一成「翻完是不是空串」，空串的键和空串的原文都算没有。
+ */
+const historyErrorText = computed(() => resolveMessage(historyError.value))
+const sessionsErrorText = computed(() => resolveMessage(sessionsError.value))
+
 /* ------------------------------------------------------------------ 侧边栏 */
 
 const sessions = ref([])
-const sessionsError = ref('')
+const sessionsError = ref(null)
 // 窄屏下侧边栏默认收起，由顶栏那个按钮唤出
 const sidebarOpen = ref(false)
 // 正在改名的那一项的 id；null 表示没有在改
@@ -116,7 +175,7 @@ const editingTitle = ref('')
 async function loadSessions() {
   try {
     sessions.value = await fetchSessions(props.link)
-    sessionsError.value = ''
+    sessionsError.value = null
   } catch (err) {
     // 拉不到会话列表不该把页面卡住：给一条提示，用户照样能发消息。
     // 这和「历史拉不到」是同一个取向 —— 侧边栏是锦上添花，不是主流程
@@ -137,7 +196,7 @@ function startNewSession(opts = {}) {
   // 这里**不写 sessionStorage**，见 persistChatId 的说明
   messages.value = []
   input.value = ''
-  if (!opts.keepNotice) historyError.value = ''
+  if (!opts.keepNotice) historyError.value = null
   stick.value = true
   sidebarOpen.value = false
   nextTick(autoGrow)
@@ -172,7 +231,7 @@ async function selectSession(id) {
   // 从侧边栏点进来的会话一定存在于库里（列表是后端给的），所以这里可以直接记
   sessionStorage.setItem(STORAGE_KEY, id)
   messages.value = []
-  historyError.value = ''
+  historyError.value = null
   sidebarOpen.value = false
   await loadHistory()
 }
@@ -222,7 +281,7 @@ async function commitRename(session) {
 }
 
 async function removeSession(session) {
-  if (!window.confirm(`删除会话「${session.title}」？这段对话的记录会一起删掉。`)) return
+  if (!window.confirm(t('chat.side.deleteConfirm', { title: session.title }))) return
   try {
     await deleteSession(session.conversationId)
     sessions.value = sessions.value.filter((s) => s.conversationId !== session.conversationId)
@@ -327,8 +386,10 @@ async function send(preset) {
       // 出错要把原因显示出来，不要静默失败
       reply.failed = true
       reply.state = 'ERROR'
+      // 存描述符。这里**不把它抄进 reply.text**：text 是正文，
+      // 抄进去就等于把错误文案冻在那一刻的语言里了。气泡里没有正文时
+      // 由 assistantHtml 兜底去读 hint，这样切语言它也跟着变
       reply.hint = friendlyError(err)
-      if (!reply.text) reply.text = reply.hint
     }
   } finally {
     streaming.value = false
@@ -375,7 +436,8 @@ function newReply() {
     state: null,
     stopped: false,
     failed: false,
-    hint: '',
+    /** 失败原因，存的是描述符不是句子（见 i18n/index.js 的 message()） */
+    hint: null,
     traceOpen: false,
   })
 }
@@ -425,7 +487,8 @@ function handleEvent(event, payload, reply) {
       break
 
     case 'ERROR':
-      reply.text = text || '生成失败。'
+      // 后端给的 text 是散文，原样显示；它没给的话才是本地那句兜底
+      reply.text = text
       reply.state = 'ERROR'
       reply.failed = true
       break
@@ -457,7 +520,7 @@ async function loadHistory() {
       // 历史是「按时间正序」的问答对，展开成扁平的消息列表
       messages.value = rows.flatMap(toPair)
     }
-    historyError.value = ''
+    historyError.value = null
     stick.value = true
     scrollToBottom(true)
   } catch (err) {
@@ -467,7 +530,7 @@ async function loadHistory() {
     // 这时留着这个 id 只会一直报错 —— 直接开一个新会话，
     // 并把刚才那句话留在提示条上告诉用户发生了什么
     if (err?.status === 404) {
-      historyError.value = '这个会话已经不存在了，已为你开了个新会话。'
+      historyError.value = message('chat.history.gone')
       startNewSession({ keepNotice: true })
       return
     }
@@ -489,7 +552,7 @@ function toPair(row) {
       state: row.state ?? null,
       stopped: false,
       failed: row.state === 'ERROR',
-      hint: '',
+      hint: null,
       traceOpen: false,
     })
   }
@@ -508,7 +571,7 @@ function toPair(row) {
  */
 function historySteps(raw) {
   if (typeof raw === 'number' && raw > 0) {
-    return [{ type: 'STEP', text: `这一轮共走了 ${raw} 步（过程明细未入库，看日志或当次对话可见）` }]
+    return [{ type: 'STEP', text: t('chat.trace.summary', { n: raw }) }]
   }
   if (typeof raw === 'string' && raw) return [{ type: 'STEP', text: raw }]
   return []
@@ -516,15 +579,22 @@ function historySteps(raw) {
 
 /* ------------------------------------------------------------------- 展示 */
 
-const STEP_LABEL = {
-  STEP: '步骤',
-  TOOL_CALL: '调用',
-  TOOL_RESULT: '返回',
-  LOOP_SIGNAL: '自检',
-  RETRIEVAL: '检索',
+/**
+ * 过程条目左边那个类型标签。
+ *
+ * 存的是**键**不是文案：这个映射原先是一张写死中文的表，切语言之后
+ * 过程区里每一行都还是中文。存键、取值时再翻，两件事就分开了。
+ * 认不出的类型直接回退成类型名本身（后端将来加了新事件类型时不至于空着）。
+ */
+const STEP_LABEL_KEYS = {
+  STEP: 'chat.trace.type.step',
+  TOOL_CALL: 'chat.trace.type.toolCall',
+  TOOL_RESULT: 'chat.trace.type.toolResult',
+  LOOP_SIGNAL: 'chat.trace.type.loopSignal',
+  RETRIEVAL: 'chat.trace.type.retrieval',
 }
 
-const stepLabel = (type) => STEP_LABEL[type] || type
+const stepLabel = (type) => (STEP_LABEL_KEYS[type] ? $t(STEP_LABEL_KEYS[type]) : type)
 
 const isLastAssistant = (msg) =>
   streaming.value && msg.role === 'assistant' && msg === messages.value[messages.value.length - 1]
@@ -536,7 +606,16 @@ const isLastAssistant = (msg) =>
  * 光标那个 span 是拼接在**消毒之后**的，是我们自己写死的字符串，不经过模型。
  */
 function assistantHtml(msg) {
-  const html = renderMarkdown(msg.text)
+  // 正文为空时按优先级兜底：失败原因 → 一句「生成失败」→ 空。
+  // **最后那支必须存在**：流式刚开始、一个字都还没到的时候正文就是空的，
+  // 那时候渲染出来的应当只有光标，不是一句「生成失败」。
+  //
+  // 这三处都是**渲染期**取值，所以切语言它们跟着变
+  // （send() 里刻意没有把 hint 抄进 text，抄进去就冻住了）
+  const source =
+    msg.text ||
+    (msg.hint ? resolveMessage(msg.hint) : msg.failed ? t('chat.fallbackAnswer') : '')
+  const html = renderMarkdown(source)
   return isLastAssistant(msg) ? `${html}<span class="caret"></span>` : html
 }
 
@@ -552,15 +631,20 @@ function toneOf(msg) {
   return ''
 }
 
-/** 气泡下方的小标记，没有就返回 null */
+/**
+ * 气泡下方的小标记，没有就返回 null。
+ *
+ * 返回的 `label` 是**渲染期翻好的**（模板里每次渲染都调一次这个函数），
+ * 所以切语言它跟着变，不需要额外做什么。
+ */
 function badgeOf(msg) {
   if (msg.role !== 'assistant') return null
-  if (msg.failed || msg.state === 'ERROR') return { label: '生成失败', tone: 'error' }
-  if (msg.stopped) return { label: '已停止', tone: 'muted' }
-  if (msg.state === 'ABORTED') return { label: '已中止', tone: 'warn' }
+  if (msg.failed || msg.state === 'ERROR') return { label: $t('chat.badge.failed'), tone: 'error' }
+  if (msg.stopped) return { label: $t('chat.badge.stopped'), tone: 'muted' }
+  if (msg.state === 'ABORTED') return { label: $t('chat.badge.aborted'), tone: 'warn' }
   // 不写「已拦截」这种像报错的说法：用户看到的应该是顾问在关心他
-  if (msg.state === 'BLOCKED') return { label: '已转为安全提示', tone: 'ask' }
-  if (msg.state === 'WAITING_FOR_USER') return { label: '等待你的回答', tone: 'ask' }
+  if (msg.state === 'BLOCKED') return { label: $t('chat.badge.blocked'), tone: 'ask' }
+  if (msg.state === 'WAITING_FOR_USER') return { label: $t('chat.badge.waiting'), tone: 'ask' }
   return null
 }
 
@@ -569,21 +653,29 @@ function hintOf(msg) {
   // 这两条只对智能体有意义：轻语是一问一答，没有「接着做」这回事；
   // 而它在轻语上的 ABORTED 只可能是内容安全拦截，那段话术自己已经说清楚了
   if (props.agent && msg.state === 'WAITING_FOR_USER') {
-    return '它在等你回答，直接接着说就行。'
+    return $t('chat.hint.waiting')
   }
   if (props.agent && msg.state === 'ABORTED' && !msg.stopped) {
-    return '任务被中止了（触发循环保护）。可以把要求拆小一点再试。'
+    return $t('chat.hint.aborted')
   }
   return ''
 }
 
-/** fetch 在网络层失败时抛的是 TypeError，给一句明确的话比原样抛英文有用得多 */
+/**
+ * 把一次失败整理成一条提示。
+ *
+ * 返回的是**描述符**（见 i18n/index.js 的 message()），不是句子：
+ * 它会存进 ref 或者挂在消息上，而那些地方都不会因为切语言而重算。
+ *
+ * fetch 在网络层失败时抛的是 TypeError，这时 `err.message` 是一句
+ * "Failed to fetch"，对用户毫无意义，换成一句能照着做的话（去看后端起没起）。
+ */
 function friendlyError(err) {
-  const msg = err?.message || ''
-  if (err?.name === 'TypeError' || /failed to fetch|networkerror|load failed/i.test(msg)) {
-    return '连不上后端服务（http://localhost:8080），请确认 Spring Boot 已经启动。'
+  const text = err?.message || ''
+  if (err?.name === 'TypeError' || /failed to fetch|networkerror|load failed/i.test(text)) {
+    return message('error.offline')
   }
-  return msg || '请求失败，请稍后重试。'
+  return text ? rawMessage(text) : message('error.generic')
 }
 
 /* --------------------------------------------------------------- 键盘交互 */
@@ -638,18 +730,24 @@ onBeforeUnmount(() => {
   // 离开页面时把在飞的请求掐掉，避免流还挂着、回调打到已经卸载的组件上
   controller?.abort()
   mediaQuery?.removeEventListener('change', onMediaChange)
+  // 主题只作用于对话页，走了就摘掉，别让首页也顶着深色的类
+  leaveChatPage()
 })
 </script>
 
 <template>
-  <div class="shell" :style="{ '--accent': accent, '--accent-soft': accent + '1f' }">
+  <div
+    class="shell"
+    :class="{ dark }"
+    :style="{ '--accent': accent, '--accent-soft': accent + '1f' }"
+  >
     <!-- ============================ 侧边栏 ============================ -->
     <!-- 遮罩只在窄屏出现，点它收起侧边栏；宽屏下它 display:none，不拦截点击 -->
     <div v-if="sidebarOpen" class="scrim" @click="sidebarOpen = false"></div>
 
     <aside class="side" :class="{ open: sidebarOpen, collapsed }">
       <div class="side-head">
-        <RouterLink v-if="!collapsed" to="/" class="brand" title="返回主页">
+        <RouterLink v-if="!collapsed" to="/" class="brand" :title="$t('chat.side.backHome')">
           <span class="dot" aria-hidden="true"></span>
           <span class="brand-name">{{ title }}</span>
         </RouterLink>
@@ -660,7 +758,7 @@ onBeforeUnmount(() => {
         <button
           class="collapse-btn"
           type="button"
-          :title="collapsed ? '展开侧边栏' : '收起侧边栏'"
+          :title="collapsed ? $t('chat.side.expand') : $t('chat.side.collapse')"
           :aria-expanded="!collapsed"
           @click="toggleCollapse"
         >
@@ -678,29 +776,29 @@ onBeforeUnmount(() => {
         class="switch"
         :to="`/${otherLink.link}`"
         :style="{ '--sw': otherLink.accent }"
-        :title="`切换到 ${otherLink.title}`"
+        :title="$t('chat.side.switchTo', { name: otherLinkTitle })"
       >
         <span class="switch-dot" aria-hidden="true"></span>
         <span class="switch-text">
-          <span class="switch-label">切换到</span>
-          <span class="switch-name">{{ otherLink.title }}</span>
+          <span class="switch-label">{{ $t('chat.side.switchLabel') }}</span>
+          <span class="switch-name">{{ otherLinkTitle }}</span>
         </span>
         <svg class="switch-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <path d="M5 12h14M13 6l6 6-6 6" />
         </svg>
       </RouterLink>
 
-      <button class="new-chat" type="button" :title="collapsed ? '新会话' : null" @click="startNewSession">
+      <button class="new-chat" type="button" :title="collapsed ? $t('chat.side.newChat') : null" @click="startNewSession">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true">
           <path d="M12 5v14M5 12h14" />
         </svg>
-        <span v-if="!collapsed">新会话</span>
+        <span v-if="!collapsed">{{ $t('chat.side.newChat') }}</span>
       </button>
 
-      <p v-if="sessionsError" class="side-error">{{ sessionsError }}</p>
+      <p v-if="sessionsErrorText" class="side-error">{{ sessionsErrorText }}</p>
 
       <nav class="sessions">
-        <p v-if="!sessions.length && !sessionsError" class="side-empty">还没有历史会话</p>
+        <p v-if="!sessions.length && !sessionsErrorText" class="side-empty">{{ $t('chat.side.noSessions') }}</p>
 
         <div
           v-for="s in sessions"
@@ -723,12 +821,12 @@ onBeforeUnmount(() => {
           </button>
 
           <span v-if="editingId !== s.conversationId" class="session-tools">
-            <button type="button" class="mini" title="重命名" @click.stop="beginRename(s)">
+            <button type="button" class="mini" :title="$t('chat.side.rename')" @click.stop="beginRename(s)">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <path d="M12 20h9M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4z" />
               </svg>
             </button>
-            <button type="button" class="mini danger" title="删除" @click.stop="removeSession(s)">
+            <button type="button" class="mini danger" :title="$t('chat.side.delete')" @click.stop="removeSession(s)">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14" />
               </svg>
@@ -748,7 +846,7 @@ onBeforeUnmount(() => {
     <!-- ============================= 主区 ============================= -->
     <div class="room">
       <header class="bar">
-        <button class="icon-btn menu" type="button" title="会话列表" @click="sidebarOpen = !sidebarOpen">
+        <button class="icon-btn menu" type="button" :title="$t('chat.side.sessions')" @click="sidebarOpen = !sidebarOpen">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
             <path d="M4 6h16M4 12h16M4 18h16" />
           </svg>
@@ -757,7 +855,7 @@ onBeforeUnmount(() => {
         <span class="dot" aria-hidden="true"></span>
         <h1 class="name">{{ title }}</h1>
 
-        <button class="ghost" type="button" @click="startNewSession">新会话</button>
+        <button class="ghost" type="button" @click="startNewSession">{{ $t('chat.side.newChat') }}</button>
         <!-- 悬停显示完整 id，方便和后端日志对上。折叠侧栏时它也跟着收起来 ——
              那时候底部那个用户菜单看不见，顶栏这个得顶上 -->
         <span class="chatid" :title="chatId">{{ shortId }}</span>
@@ -767,7 +865,7 @@ onBeforeUnmount(() => {
 
       <div ref="listEl" class="list" @scroll.passive="onScroll">
         <div class="column">
-          <p v-if="historyError" class="notice">{{ historyError }}</p>
+          <p v-if="historyErrorText" class="notice">{{ historyErrorText }}</p>
 
           <div v-if="!messages.length" class="empty">
             <h2>{{ welcome }}</h2>
@@ -787,7 +885,9 @@ onBeforeUnmount(() => {
                   <svg class="caret-icon" :class="{ open: msg.traceOpen }" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <path d="M9 18l6-6-6-6" />
                   </svg>
-                  过程 {{ msg.steps.length }} 步
+                  <!-- 用复数形式（t 的第三个参数是 count）：中文两档一样，
+                       英文才会正确地在 1 步时说 step 而不是 steps -->
+                  {{ $t('chat.trace.steps', { n: msg.steps.length }, msg.steps.length) }}
                 </button>
                 <ul v-show="msg.traceOpen" class="trace-list">
                   <li v-for="(s, i) in msg.steps" :key="i" :class="`trace-${s.type.toLowerCase()}`">
@@ -803,8 +903,11 @@ onBeforeUnmount(() => {
 
               <!-- 助手消息按 markdown 渲染。安全性见 markdown.js：
                    先关掉内联 HTML，再用 DOMPurify 消毒，两道都做才允许 v-html -->
+              <!-- 后两个条件不能省：正文为空但有失败原因（或整条就是「生成失败」）时，
+                   气泡里得有东西可显示。只看 msg.text 的话，一次「还没出字就断了」
+                   的错误会渲染成一个空气泡，看着像界面坏了 -->
               <div
-                v-else-if="msg.text || isLastAssistant(msg)"
+                v-else-if="msg.text || msg.hint || msg.failed || isLastAssistant(msg)"
                 class="text md"
                 v-html="assistantHtml(msg)"
               ></div>
@@ -832,10 +935,10 @@ onBeforeUnmount(() => {
             ></textarea>
 
             <!-- 生成中时按钮变「停止」：既给了中断手段，也顺手挡住同一会话的并发发送 -->
-            <button v-if="streaming" type="button" class="send stop" @click="stop">停止</button>
-            <button v-else type="button" class="send" :disabled="!canSend" @click="send()">发送</button>
+            <button v-if="streaming" type="button" class="send stop" @click="stop">{{ $t('chat.composer.stop') }}</button>
+            <button v-else type="button" class="send" :disabled="!canSend" @click="send()">{{ $t('chat.composer.send') }}</button>
           </div>
-          <p class="tip">Enter 发送，Shift + Enter 换行</p>
+          <p class="tip">{{ $t('chat.composer.tip') }}</p>
         </div>
       </div>
     </div>
@@ -843,10 +946,151 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+/*
+ * 颜色 token。
+ *
+ * 深色主题的做法是**两层**：
+ *
+ *   1. 复用全局变量的直接在这里重新赋值（见 `.shell.dark`）。`--page`/`--ink`/
+ *      `--line` 这些来自 base.css 的 `:root`，而自定义属性是**可以被子元素覆盖**的——
+ *      在 `.shell` 上说一句 `--line: #2e323a`，这个子树里的 `var(--line)` 全部跟着变，
+ *      一条都不用改。这是让改动量可控的关键。
+ *      它们只作用在 `.shell` 子树上，所以首页/登录/知识库完全不受影响。
+ *   2. 组件里**自己写死**的那些颜色（浅色下 41 个不同取值）没有变量可复用，
+ *      就地归拢成下面这批 `--c-*` 语义 token。浅色值写在这里，
+ *      深色值写在同一文件下面的 `.shell.dark` 里。
+ *
+ * 命名按「用途」不按「颜色」：`--c-text-2` 而不是 `--c-gray-2`，
+ * 这样以后调色不用改名字。文本从深到浅分 6 级（1 最深），
+ * 浅色下原本有 13 个不同的灰，那是历史堆积，不是设计——归成 6 级足够。
+ */
 .shell {
+  /* 面 */
+  --c-side: #fbfbfc;
+  --c-surface: #fff;
+  --c-surface-hover: #fdfdff;
+  --c-subtle: #eef0f4;
+  --c-bubble-muted: #fbfbfc;
+  --c-code-inline: #f2f3f6;
+  --c-code-block: #f7f8fa;
+  --c-chrome: rgba(255, 255, 255, 0.82);
+  --c-chrome-strong: rgba(255, 255, 255, 0.86);
+  --c-tint-hover: rgba(10, 15, 30, 0.06);
+
+  /* 线 */
+  --c-border-input: #dfe2e8;
+  --c-border-warn: #eccb99;
+  --c-border-error: #eeb6b6;
+
+  /* 字。1 是正文，6 是最淡的辅助说明 */
+  --c-text-1: #14161a;
+  --c-text-2: #3d4653;
+  --c-text-3: #5b6472;
+  --c-text-4: #77808f;
+  --c-text-5: #8b94a3;
+  --c-text-6: #a0a7b3;
+
+  /*
+   * 强调色上的字。**和 --c-surface 是两回事，别合并。**
+   * 用户气泡和发送按钮是「强调色底 + 白字」，深色下底色不变，
+   * 这两个 `#fff` 也就不该跟着面一起翻成深色——翻了就是深底深字，
+   * 用户自己发的消息直接看不见。
+   */
+  --c-on-accent: #fff;
+
+  /* 语义色 */
+  --c-danger: #b0322f;
+  --c-warn-text: #8a6220;
+  --c-danger-bg: #fdeaea;
+  --c-warn-bg: #fdf1dd;
+  --c-notice-bg: #fffbf4;
+  --c-error-bg: #fff8f8;
+  --c-success-bg: #e2f3ee;
+  --c-success: #0a7d55;
+
+  /* 阴影和遮罩。浅色下用黑色低透明度；深色下底色本身就深，
+     同样的黑几乎看不见，所以深色那边要加大不透明度 */
+  --c-shadow-bubble: rgba(16, 20, 30, 0.04);
+  --c-shadow-drawer: rgba(16, 20, 30, 0.14);
+  --c-scrim: rgba(16, 20, 30, 0.32);
+
+  /* highlight.js。自己写的一套，深色下是另一套调色板 */
+  --c-hljs-comment: #8b94a3;
+  --c-hljs-keyword: #a626a4;
+  --c-hljs-string: #0a7d55;
+  --c-hljs-number: #b06400;
+  --c-hljs-title: #1a6fd4;
+
   display: flex;
   height: 100dvh;
   background: var(--page);
+  /*
+   * 这里必须显式写一次字色，**不能靠继承**。
+   *
+   * 不写的话，色值来自 `base.css` 的 `body { color: var(--ink) }`——
+   * 那个 `var(--ink)` 是在 body 元素上解析的，取的是 `:root` 里的 #14161a。
+   * 下面 `.shell.dark` 虽然也重新赋值了 `--ink`，但那只影响**在 .shell 子树里
+   * 引用 var(--ink) 的地方**，管不到 body 已经解析好的那个值——继承下来的是深色。
+   *
+   * 表现就是：输入框（`textarea { color: inherit }`）和会话重命名框在深色下
+   * 是「深底上的深字」，几乎看不见。所有没显式设过颜色、靠继承的元素都吃这个亏。
+   */
+  color: var(--c-text-1);
+}
+
+/*
+ * 深色。类由 `theme.js` 按「用户选了深色 且 对话页开着」两个条件挂上来。
+ *
+ * 上面一半是**覆盖 base.css 的全局变量**：这是最省事的一层，
+ * 组件里那 20 多处 `var(--line)`、`var(--ink)` 一条都不用动。
+ * 下面一半是覆盖本组件自己的语义 token。
+ */
+.shell.dark {
+  --page: #0f1115;
+  --ink: #e6e8ee;
+  --line: #2e323a;
+  --line-strong: #3a3f49;
+
+  --c-side: #14161b;
+  --c-surface: #1e2026;
+  --c-surface-hover: #23262d;
+  --c-subtle: #262a31;
+  --c-bubble-muted: #1a1c22;
+  --c-code-inline: #262a31;
+  --c-code-block: #17191e;
+  --c-chrome: rgba(20, 22, 27, 0.82);
+  --c-chrome-strong: rgba(20, 22, 27, 0.86);
+  --c-tint-hover: rgba(255, 255, 255, 0.07);
+
+  --c-border-input: #33373f;
+  --c-border-warn: #4d3f28;
+  --c-border-error: #5a3232;
+
+  --c-text-1: #e6e8ee;
+  --c-text-2: #c8ccd6;
+  --c-text-3: #a8aebc;
+  --c-text-4: #8b93a3;
+  --c-text-5: #737b8b;
+  --c-text-6: #666e7d;
+
+  --c-danger: #f08a86;
+  --c-warn-text: #e0b878;
+  --c-danger-bg: #3a2020;
+  --c-warn-bg: #3a2f1c;
+  --c-notice-bg: #2a2418;
+  --c-error-bg: #2e1e1e;
+  --c-success-bg: #16302a;
+  --c-success: #6cc9a8;
+
+  --c-shadow-bubble: rgba(0, 0, 0, 0.4);
+  --c-shadow-drawer: rgba(0, 0, 0, 0.55);
+  --c-scrim: rgba(0, 0, 0, 0.5);
+
+  --c-hljs-comment: #6b7383;
+  --c-hljs-keyword: #d9a0d6;
+  --c-hljs-string: #7ec99f;
+  --c-hljs-number: #e0b070;
+  --c-hljs-title: #7fb4ef;
 }
 
 /* ---------------------------------------------------------------- 侧边栏 */
@@ -857,7 +1101,7 @@ onBeforeUnmount(() => {
   flex: none;
   width: 264px;
   border-right: 1px solid var(--line);
-  background: #fbfbfc;
+  background: var(--c-side);
   /* 折叠时宽度变窄，用过渡而不是瞬间跳变：整个页面会跟着重排，
      突变看起来像卡了一下 */
   transition: width 0.2s cubic-bezier(0.16, 0.84, 0.44, 1);
@@ -912,12 +1156,12 @@ onBeforeUnmount(() => {
   border: none;
   border-radius: 7px;
   background: transparent;
-  color: #98a0b0;
+  color: var(--c-text-6);
   transition: background 0.16s ease, color 0.16s ease;
 }
 .collapse-btn:hover {
-  background: rgba(10, 15, 30, 0.06);
-  color: #4a5468;
+  background: var(--c-tint-hover);
+  color: var(--c-text-3);
 }
 .collapse-btn svg {
   width: 16px;
@@ -944,14 +1188,14 @@ onBeforeUnmount(() => {
   padding: 9px 11px;
   border: 1px solid var(--line);
   border-radius: 11px;
-  background: #fff;
+  background: var(--c-surface);
   color: inherit;
   text-decoration: none;
   transition: border-color 0.18s ease, background 0.18s ease;
 }
 .switch:hover {
   border-color: var(--sw);
-  background: #fdfdff;
+  background: var(--c-surface-hover);
 }
 
 .switch-dot {
@@ -971,14 +1215,14 @@ onBeforeUnmount(() => {
 }
 
 .switch-label {
-  color: #9aa2b2;
+  color: var(--c-text-6);
   font-size: 10.5px;
   letter-spacing: 0.02em;
 }
 
 .switch-name {
   overflow: hidden;
-  color: #2c3444;
+  color: var(--c-text-2);
   font-size: 13px;
   font-weight: 500;
   white-space: nowrap;
@@ -1018,8 +1262,8 @@ onBeforeUnmount(() => {
   padding: 9px 12px;
   border: 1px solid var(--line);
   border-radius: 10px;
-  background: #fff;
-  color: #3d4653;
+  background: var(--c-surface);
+  color: var(--c-text-2);
   font-size: 13.5px;
   transition: border-color 0.18s ease, color 0.18s ease, background 0.18s ease;
 }
@@ -1035,7 +1279,7 @@ onBeforeUnmount(() => {
 
 .side-error {
   margin: 0 14px 8px;
-  color: #b0322f;
+  color: var(--c-danger);
   font-size: 12px;
   line-height: 1.5;
 }
@@ -1048,7 +1292,7 @@ onBeforeUnmount(() => {
 
 .side-empty {
   padding: 18px 8px;
-  color: #a0a7b3;
+  color: var(--c-text-6);
   font-size: 12.5px;
   text-align: center;
 }
@@ -1061,7 +1305,7 @@ onBeforeUnmount(() => {
   transition: background 0.15s ease;
 }
 .session:hover {
-  background: #eef0f4;
+  background: var(--c-subtle);
 }
 .session.active {
   background: var(--accent-soft);
@@ -1073,7 +1317,7 @@ onBeforeUnmount(() => {
   padding: 8px 10px;
   border: none;
   background: none;
-  color: #3d4653;
+  color: var(--c-text-2);
   font-size: 13px;
   text-align: left;
   /* 标题一行放不下就省略，不要把侧边栏撑宽或者换行 */
@@ -1093,7 +1337,7 @@ onBeforeUnmount(() => {
   padding: 5px 8px;
   border: 1px solid var(--accent);
   border-radius: 7px;
-  background: #fff;
+  background: var(--c-surface);
   font: inherit;
   font-size: 13px;
   outline: none;
@@ -1118,14 +1362,14 @@ onBeforeUnmount(() => {
   border: none;
   border-radius: 6px;
   background: none;
-  color: #8b94a3;
+  color: var(--c-text-5);
 }
 .mini:hover {
-  background: #fff;
+  background: var(--c-surface);
   color: var(--ink);
 }
 .mini.danger:hover {
-  color: #b0322f;
+  color: var(--c-danger);
 }
 .mini svg {
   width: 13px;
@@ -1158,7 +1402,7 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 10px;
   padding: 12px 20px;
-  background: rgba(255, 255, 255, 0.82);
+  background: var(--c-chrome);
   backdrop-filter: blur(10px);
   border-bottom: 1px solid var(--line);
 }
@@ -1171,10 +1415,10 @@ onBeforeUnmount(() => {
   border: none;
   border-radius: 9px;
   background: none;
-  color: #5b6472;
+  color: var(--c-text-3);
 }
 .icon-btn:hover {
-  background: #eef0f4;
+  background: var(--c-subtle);
 }
 .icon-btn svg {
   width: 17px;
@@ -1204,8 +1448,8 @@ onBeforeUnmount(() => {
   margin-left: auto;
   padding: 3px 9px;
   border-radius: 999px;
-  background: #eef0f4;
-  color: #77808f;
+  background: var(--c-subtle);
+  color: var(--c-text-4);
   font-size: 11px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   cursor: default;
@@ -1215,9 +1459,9 @@ onBeforeUnmount(() => {
   padding: 5px 11px;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: #fff;
+  background: var(--c-surface);
   font-size: 12.5px;
-  color: #46505f;
+  color: var(--c-text-3);
   transition: border-color 0.18s ease, color 0.18s ease, background 0.18s ease;
 }
 .ghost:hover {
@@ -1243,10 +1487,10 @@ onBeforeUnmount(() => {
 .notice {
   margin-bottom: 16px;
   padding: 10px 14px;
-  border: 1px solid #f0d8b0;
+  border: 1px solid var(--c-border-warn);
   border-radius: 10px;
-  background: #fffaf1;
-  color: #8a6220;
+  background: var(--c-notice-bg);
+  color: var(--c-warn-text);
   font-size: 13px;
 }
 
@@ -1272,32 +1516,33 @@ onBeforeUnmount(() => {
 
 .row.user .bubble {
   background: var(--accent);
-  color: #fff;
+  /* 注意不是 --c-surface：这是**强调色上的字**，深色下底色和字色都不变 */
+  color: var(--c-on-accent);
   border-bottom-right-radius: 5px;
 }
 
 .row.assistant .bubble {
-  background: #fff;
+  background: var(--c-surface);
   color: var(--ink);
   border: 1px solid var(--line);
   border-bottom-left-radius: 5px;
-  box-shadow: 0 1px 2px rgba(16, 20, 30, 0.04);
+  box-shadow: 0 1px 2px var(--c-shadow-bubble);
 }
 
 .row.assistant .bubble.tone-warn {
-  border-color: #eccb99;
-  background: #fffbf4;
+  border-color: var(--c-border-warn);
+  background: var(--c-notice-bg);
 }
 .row.assistant .bubble.tone-error {
-  border-color: #eeb6b6;
-  background: #fff8f8;
+  border-color: var(--c-border-error);
+  background: var(--c-error-bg);
 }
 .row.assistant .bubble.tone-ask {
   border-color: var(--accent);
-  background: #fff;
+  background: var(--c-surface);
 }
 .row.assistant .bubble.tone-muted {
-  background: #fbfbfc;
+  background: var(--c-bubble-muted);
 }
 
 .text {
@@ -1330,16 +1575,16 @@ onBeforeUnmount(() => {
   border-radius: 999px;
   font-size: 11px;
   line-height: 1.7;
-  background: #eef0f4;
-  color: #5b6472;
+  background: var(--c-subtle);
+  color: var(--c-text-3);
 }
 .badge-error {
-  background: #fdeaea;
-  color: #b0322f;
+  background: var(--c-danger-bg);
+  color: var(--c-danger);
 }
 .badge-warn {
-  background: #fdf1dd;
-  color: #93631a;
+  background: var(--c-warn-bg);
+  color: var(--c-warn-text);
 }
 .badge-ask {
   background: var(--accent-soft);
@@ -1350,7 +1595,7 @@ onBeforeUnmount(() => {
   max-width: min(80%, 660px);
   margin-top: 6px;
   padding-left: 4px;
-  color: #838c9b;
+  color: var(--c-text-5);
   font-size: 12.5px;
   line-height: 1.6;
 }
@@ -1401,7 +1646,7 @@ onBeforeUnmount(() => {
   margin: 10px 0;
   padding: 2px 0 2px 12px;
   border-left: 3px solid var(--line);
-  color: #6b7381;
+  color: var(--c-text-4);
 }
 .md :deep(a) {
   color: var(--accent);
@@ -1411,7 +1656,7 @@ onBeforeUnmount(() => {
 .md :deep(code) {
   padding: 1.5px 5px;
   border-radius: 5px;
-  background: #f2f3f6;
+  background: var(--c-code-inline);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.88em;
 }
@@ -1419,7 +1664,7 @@ onBeforeUnmount(() => {
   margin: 10px 0;
   padding: 11px 13px;
   border-radius: 10px;
-  background: #f7f8fa;
+  background: var(--c-code-block);
   border: 1px solid var(--line);
   overflow-x: auto;
 }
@@ -1443,7 +1688,7 @@ onBeforeUnmount(() => {
   text-align: left;
 }
 .md :deep(th) {
-  background: #f7f8fa;
+  background: var(--c-code-block);
   font-weight: 600;
 }
 .md :deep(hr) {
@@ -1452,30 +1697,32 @@ onBeforeUnmount(() => {
   border-top: 1px solid var(--line);
 }
 
-/* highlight.js 的配色（自己写，不引它的主题包：只需要几个 token） */
+/* highlight.js 的配色（自己写，不引它的主题包：只需要几个 token）。
+   浅色那套在深色底上基本读不出来（比如 #0a7d55 的绿），所以深色是另一套调色板，
+   见上面的 .shell.dark */
 .md :deep(.hljs-comment),
 .md :deep(.hljs-quote) {
-  color: #8b94a3;
+  color: var(--c-hljs-comment);
   font-style: italic;
 }
 .md :deep(.hljs-keyword),
 .md :deep(.hljs-selector-tag),
 .md :deep(.hljs-literal) {
-  color: #a626a4;
+  color: var(--c-hljs-keyword);
 }
 .md :deep(.hljs-string),
 .md :deep(.hljs-attr),
 .md :deep(.hljs-addition) {
-  color: #0a7d55;
+  color: var(--c-hljs-string);
 }
 .md :deep(.hljs-number),
 .md :deep(.hljs-built_in) {
-  color: #b06400;
+  color: var(--c-hljs-number);
 }
 .md :deep(.hljs-title),
 .md :deep(.hljs-function),
 .md :deep(.hljs-section) {
-  color: #1a6fd4;
+  color: var(--c-hljs-title);
 }
 
 /* ------------------------------------------------------------ 工具调用过程 */
@@ -1493,7 +1740,7 @@ onBeforeUnmount(() => {
   padding: 0;
   border: none;
   background: none;
-  color: #77808f;
+  color: var(--c-text-4);
   font-size: 12px;
 }
 .trace-toggle:hover {
@@ -1522,7 +1769,7 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: flex-start;
   gap: 8px;
-  color: #77808f;
+  color: var(--c-text-4);
   font-size: 12px;
   line-height: 1.55;
 }
@@ -1532,8 +1779,8 @@ onBeforeUnmount(() => {
   min-width: 30px;
   padding: 0 6px;
   border-radius: 4px;
-  background: #eef0f4;
-  color: #5b6472;
+  background: var(--c-subtle);
+  color: var(--c-text-3);
   font-size: 11px;
   line-height: 18px;
   text-align: center;
@@ -1545,12 +1792,12 @@ onBeforeUnmount(() => {
 /* 检索那条用青绿标出来：它和工具调用不是一回事，
    用户要能一眼看到「知识库到底查了没有」 */
 .trace-retrieval .trace-type {
-  background: #e2f3ee;
-  color: #0a7d55;
+  background: var(--c-success-bg);
+  color: var(--c-success);
 }
 .trace-loop_signal .trace-type {
-  background: #fdf1dd;
-  color: #93631a;
+  background: var(--c-warn-bg);
+  color: var(--c-warn-text);
 }
 
 .trace-text {
@@ -1574,7 +1821,7 @@ onBeforeUnmount(() => {
 .intro {
   max-width: 34em;
   margin: 10px auto 0;
-  color: #6b7381;
+  color: var(--c-text-4);
   font-size: 14px;
   line-height: 1.75;
 }
@@ -1591,8 +1838,8 @@ onBeforeUnmount(() => {
   padding: 8px 14px;
   border: 1px solid var(--line);
   border-radius: 999px;
-  background: #fff;
-  color: #46505f;
+  background: var(--c-surface);
+  color: var(--c-text-3);
   font-size: 13px;
   text-align: left;
   transition: border-color 0.18s ease, color 0.18s ease, background 0.18s ease, transform 0.18s ease;
@@ -1608,7 +1855,7 @@ onBeforeUnmount(() => {
 
 .composer {
   padding: 10px 20px 16px;
-  background: rgba(255, 255, 255, 0.86);
+  background: var(--c-chrome-strong);
   backdrop-filter: blur(10px);
   border-top: 1px solid var(--line);
 }
@@ -1623,9 +1870,9 @@ onBeforeUnmount(() => {
   align-items: flex-end;
   gap: 10px;
   padding: 7px 7px 7px 14px;
-  border: 1px solid #dfe2e8;
+  border: 1px solid var(--c-border-input);
   border-radius: 14px;
-  background: #fff;
+  background: var(--c-surface);
   transition: border-color 0.18s ease, box-shadow 0.18s ease;
 }
 .box:focus-within {
@@ -1648,7 +1895,7 @@ textarea {
   overflow-y: auto;
 }
 textarea::placeholder {
-  color: #a3aab6;
+  color: var(--c-text-6);
 }
 
 .send {
@@ -1657,7 +1904,7 @@ textarea::placeholder {
   border: none;
   border-radius: 10px;
   background: var(--accent);
-  color: #fff;
+  color: var(--c-on-accent);
   font-size: 14px;
   transition: opacity 0.18s ease, filter 0.18s ease;
 }
@@ -1670,20 +1917,20 @@ textarea::placeholder {
 }
 
 .stop {
-  background: #fff;
-  color: #46505f;
-  border: 1px solid #dfe2e8;
+  background: var(--c-surface);
+  color: var(--c-text-3);
+  border: 1px solid var(--c-border-input);
 }
 .stop:hover {
-  border-color: #b0322f;
-  color: #b0322f;
+  border-color: var(--c-danger);
+  color: var(--c-danger);
   filter: none;
 }
 
 .tip {
   margin-top: 7px;
   padding-left: 3px;
-  color: #a0a7b3;
+  color: var(--c-text-6);
   font-size: 11.5px;
 }
 
@@ -1699,7 +1946,7 @@ textarea::placeholder {
     z-index: 20;
     transform: translateX(-100%);
     transition: transform 0.22s ease;
-    box-shadow: 0 0 40px rgba(16, 20, 30, 0.14);
+    box-shadow: 0 0 40px var(--c-shadow-drawer);
   }
   .side.open {
     transform: translateX(0);
@@ -1740,7 +1987,7 @@ textarea::placeholder {
     position: fixed;
     inset: 0;
     z-index: 10;
-    background: rgba(16, 20, 30, 0.32);
+    background: var(--c-scrim);
   }
   .menu {
     display: grid;

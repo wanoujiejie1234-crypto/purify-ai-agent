@@ -54,7 +54,7 @@ public class LoopGuard {
             }
 
             LoopSignal signal = found.get();
-            run.recordLoopHit(signal);
+            run.recordLoopHit();
             for (LoopHandler handler : this.handlers) {
                 if (!handler.supports(signal)) {
                     continue;

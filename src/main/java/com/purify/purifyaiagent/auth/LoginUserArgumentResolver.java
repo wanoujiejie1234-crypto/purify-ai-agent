@@ -45,8 +45,6 @@ public class LoginUserArgumentResolver implements HandlerMethodArgumentResolver 
         // 最可能的原因是这个接口忘了标 @RequireLogin——鉴权拦截器没解析令牌，
         // 属性自然就是空的。把这句话写进异常里，比让一个 null 顺着代码流下去
         // 最后在某处变成 NPE 要好查得多
-        throw AuthException.unauthorized(
-                "当前接口没有登录用户，但它声明了 @CurrentUser。"
-                        + "最常见的原因是这个方法忘了标 @RequireLogin（见 " + parameter.getMethod() + "）");
+        throw AuthException.unauthorized("error.auth.missingCurrentUser", parameter.getMethod());
     }
 }

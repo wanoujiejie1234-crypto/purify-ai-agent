@@ -6,15 +6,12 @@ import com.alibaba.cloud.ai.model.RerankRequest;
 import com.alibaba.cloud.ai.model.RerankResponse;
 import com.purify.purifyaiagent.config.PgVectorProperties;
 import com.purify.purifyaiagent.config.RagProperties;
-import com.purify.purifyaiagent.rag.KnowledgeRouter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.rag.Query;
 import org.springframework.ai.rag.retrieval.search.DocumentRetriever;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
-import org.springframework.ai.vectorstore.filter.Filter;
-import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
 import org.springframework.lang.Nullable;
 import org.springframework.util.CollectionUtils;
 
@@ -25,17 +22,28 @@ import java.util.stream.Collectors;
 /**
  * 本地 pgvector 检索器 —— 流程图右半边「文档过滤和检索」那一段。
  *
- * <p>一次 {@link #retrieve} 做两件事，对应图里的两段箭头：
+ * <p>一次 {@link #retrieve} 走四步：
  * <ol>
- *   <li><b>粗排</b>：把问题向量化（{@code VectorStore} 内部完成），在 pgvector 里做
- *       相似度搜索，带上分类过滤条件，捞出 {@code coarse-top-k} 条候选；</li>
+ *   <li><b>向量粗排</b>：把问题向量化（{@code VectorStore} 内部完成），在 pgvector 里做
+ *       相似度搜索，带上分类过滤条件，捞出 {@code coarse-top-k} 条；</li>
+ *   <li><b>关键词检索</b>：按字面精确匹配再捞一路（见 {@link PgKeywordSearcher}），
+ *       补向量路在专有名词上的短板；</li>
+ *   <li><b>RRF 融合</b>：两路按<b>名次</b>合成一个候选集（见 {@link RrfFusion}）；</li>
  *   <li><b>精排</b>：把候选交给 DashScope 的 Rank 模型打分，按分数过滤、倒序、
  *       截到 {@code rerank-top-n} 条。</li>
  * </ol>
  *
+ * <p><b>关键词那一路是可以没有的。</b>构造时传 {@code null}，或者运行时探测到
+ * pg_bigm 不可用（见 {@link PgKeywordSearcher#status()}），整条链路的行为就
+ * <b>逐字节等于</b>加这一路之前的样子——纯向量粗排 + 精排。
+ * 这不是顺手得到的好处，而是这一路唯一安全的降级方式：它的 SQL 不调用任何
+ * pg_bigm 函数，所以扩展没装时查询不会报错、只会静默全表扫，靠 catch 异常根本发现不了。
+ *
  * <p><b>分类过滤的语义与百炼那条链路保持一致</b>（见 {@code RoutingDocumentRetriever}）：
  * 恰好命中一个分类才带过滤条件，命中多个或一个都没命中时不带过滤查全库。
  * 理由是宁可多带点噪声让重排去压，也不要因为分类判定粗糙而漏掉正确答案。
+ * <b>判定只做一次，两条路共用</b>（见 {@link ClassificationFilter}）——
+ * 两路按不同的分类去查是这里最隐蔽的错法，合起来的结果既不报错也说不清是怎么来的。
  *
  * <p>本类是单例、可能被并发调用，所以「这次该按哪个分类过滤」来自
  * {@link Query#context()} 而不是本类的字段。
@@ -71,85 +79,112 @@ public class PgVectorDocumentRetriever implements DocumentRetriever {
     @Nullable
     private final RerankModel rerankModel;
 
+    /**
+     * 关键词检索那一路。
+     *
+     * <p>可以是 {@code null}——没装配，或者刻意不传（纯向量模式）。那时整条链路
+     * 与加这一路之前完全一致，这不是巧合而是设计要求：它是降级路径，必须零风险。
+     */
+    @Nullable
+    private final PgKeywordSearcher keywordSearcher;
+
     public PgVectorDocumentRetriever(VectorStore vectorStore,
                                      RagProperties ragProperties,
                                      PgVectorProperties pgVectorProperties,
-                                     @Nullable RerankModel rerankModel) {
+                                     @Nullable RerankModel rerankModel,
+                                     @Nullable PgKeywordSearcher keywordSearcher) {
         this.vectorStore = vectorStore;
         this.ragProperties = ragProperties;
         this.pgVectorProperties = pgVectorProperties;
         this.rerankModel = rerankModel;
+        this.keywordSearcher = keywordSearcher;
     }
 
     @Override
     public List<Document> retrieve(Query query) {
+        // 分类过滤**只判定一次**，两条路共用。各判各的话，漂移的表现是
+        // 同一次检索里两条路按不同的分类在查——结果既不报错也说不清是怎么来的
+        ClassificationFilter filter = ClassificationFilter.decide(query, ragProperties);
+
+        long vectorStart = System.currentTimeMillis();
+        List<Document> vectorHits = vectorSearch(query, filter);
+        long vectorMs = System.currentTimeMillis() - vectorStart;
+
+        long keywordStart = System.currentTimeMillis();
+        List<Document> keywordHits = keywordSearch(query, filter);
+        long keywordMs = System.currentTimeMillis() - keywordStart;
+
+        if (vectorHits.isEmpty() && keywordHits.isEmpty()) {
+            // 打 INFO 而不是 DEBUG：「知识库好像没工作」最常见的原因就是表里没东西或
+            // 过滤条件把结果全筛掉了，而 DEBUG 在生产默认不输出——日志里一片安静，
+            // 看起来和「压根没查」一模一样，这正是排查时最想分清的两种情形
+            log.info("[pgvector] 两路都没召回切片（向量 {}ms / 关键词 {}ms，分类过滤 {}）：{}",
+                    vectorMs, keywordMs, filter.isPresent() ? filter.value() : "无", query.text());
+            return List.of();
+        }
+
+        // 注意这里**不能**在向量路为空时提前返回：向量 0 条、关键词 5 条是完全可能的
+        // （问的正好是一个生僻专有名词），提前返回会把关键词那一路的成果静默丢掉
+        List<Document> candidates = RrfFusion.fuse(
+                List.of(new RrfFusion.Arm("vector", vectorHits), new RrfFusion.Arm("keyword", keywordHits)),
+                pgVectorProperties.getRrf().getK(),
+                pgVectorProperties.getRrf().getTopK());
+
+        warnIfArmsDoNotOverlap(vectorHits, keywordHits, candidates.size());
+
+        long rerankStart = System.currentTimeMillis();
+        List<Document> reranked = rerank(query.text(), candidates);
+
+        // 一次一行，把三段耗时分开报：向量粗排是本地的、关键词检索是一次数据库查询、
+        // 精排是一次远程模型调用，「检索很慢」时先怀疑哪一段，看这一行就够了
+        log.info("[pgvector] 向量 {} 条（{}ms）+ 关键词 {} 条（{}ms）"
+                        + "→ 融合去重后 {} 条 → 精排 {} 条（{}ms）：{}",
+                vectorHits.size(), vectorMs, keywordHits.size(), keywordMs,
+                candidates.size(), reranked.size(), System.currentTimeMillis() - rerankStart,
+                query.text());
+        return reranked;
+    }
+
+    /**
+     * 两路都召回了东西、却一条都不重叠时告警。
+     *
+     * <p>这是 RRF 最隐蔽的失效方式：去重靠 {@code Document.getId()}，而两路的 id
+     * 来自不同的地方（向量路是表主键、关键词路也是表主键，正常必然重叠）。
+     * 一旦对不上，RRF 就<b>退化成简单拼接</b>——结果仍然「看起来正常」，
+     * 只是融合这一步白做了，没有任何别的迹象。
+     */
+    private static void warnIfArmsDoNotOverlap(List<Document> vectorHits,
+                                               List<Document> keywordHits,
+                                               int fusedCount) {
+        if (vectorHits.isEmpty() || keywordHits.isEmpty()) {
+            return;
+        }
+        if (fusedCount >= vectorHits.size() + keywordHits.size()) {
+            log.warn("[pgvector] 向量路 {} 条与关键词路 {} 条完全没有重叠——两边的 "
+                            + "Document id 可能不是同一套。对不上的话 RRF 会退化成简单拼接，"
+                            + "融合这一步就白做了",
+                    vectorHits.size(), keywordHits.size());
+        }
+    }
+
+    /** 向量那一路：相似度粗排 + 分类过滤。 */
+    private List<Document> vectorSearch(Query query, ClassificationFilter filter) {
         SearchRequest.Builder searchRequest = SearchRequest.builder()
                 .query(query.text())
                 .topK(pgVectorProperties.getCoarseTopK())
                 // 默认 0.0 = 粗排不裁，把「像不像」的判断交给重排模型，
                 // 因为余弦相似度的绝对值在不同问题之间并不可比
                 .similarityThreshold(pgVectorProperties.getSimilarityThreshold());
-
-        Filter.Expression filter = buildFilter(query);
-        if (filter != null) {
-            searchRequest.filterExpression(filter);
-        }
-
-        long searchStart = System.currentTimeMillis();
-        List<Document> candidates = vectorStore.similaritySearch(searchRequest.build());
-        long searchMs = System.currentTimeMillis() - searchStart;
-
-        if (CollectionUtils.isEmpty(candidates)) {
-            // 打 INFO 而不是 DEBUG：「知识库好像没工作」最常见的原因就是表里没东西或
-            // 过滤条件把结果全筛掉了，而 DEBUG 在生产默认不输出——日志里一片安静，
-            // 看起来和「压根没查」一模一样，这正是排查时最想分清的两种情形
-            log.info("[pgvector] 粗排没召回任何切片（耗时 {}ms，分类过滤 {}）：{}",
-                    searchMs, filter == null ? "无" : "有", query.text());
-            return List.of();
-        }
-
-        long rerankStart = System.currentTimeMillis();
-        List<Document> reranked = rerank(query.text(), candidates);
-
-        // 一次一行，把两段耗时分开报：粗排是本地的向量检索、精排是一次远程模型调用，
-        // 「检索很慢」时先怀疑哪一段，看这一行就够了
-        log.info("[pgvector] 粗排 {} 条（{}ms）→ 精排 {} 条（{}ms）：{}",
-                candidates.size(), searchMs,
-                reranked.size(), System.currentTimeMillis() - rerankStart,
-                query.text());
-        return reranked;
+        filter.toSpringAiFilter().ifPresent(searchRequest::filterExpression);
+        return vectorStore.similaritySearch(searchRequest.build());
     }
 
-    /**
-     * 按路由结果构造分类过滤条件。
-     *
-     * @return 恰好命中一个已知分类时返回过滤表达式；其余情况返回 {@code null} 表示查全库
-     */
-    @Nullable
-    private Filter.Expression buildFilter(Query query) {
-        Object raw = query.context().get(KnowledgeRouter.CATEGORIES_KEY);
-        if (!(raw instanceof List<?> categories) || categories.size() != 1) {
-            return null;
+    /** 关键词那一路。没装配这个协作者时安静地返回空，等价于纯向量模式。 */
+    private List<Document> keywordSearch(Query query, ClassificationFilter filter) {
+        if (keywordSearcher == null) {
+            return List.of();
         }
-
-        String category = String.valueOf(categories.get(0));
-
-        // 分类名来自路由的关键词表，而过滤用的字段名与取值必须和写入端一致。
-        // 对不上时直接查全库，而不是拿一个查不到东西的条件去查——
-        // 否则表现是「知识库突然什么都检索不到」，比多带点无关切片难查得多
-        boolean known = ragProperties.getRouter().getCategories().stream()
-                .anyMatch(item -> category.equals(item.getValue()));
-        if (!known) {
-            log.warn("[pgvector] 配置里没有分类「{}」，退回全库检索", category);
-            return null;
-        }
-
-        // 字段名取自配置而不是硬编码 classification：用户可以改 filter-key，
-        // 但如果只改一边（写入端写的是改后的、检索端还在用硬编码的），
-        // 过滤就会永远查不到任何东西且不报错
-        String filterKey = ragProperties.getRouter().getFilterKey();
-        log.debug("[pgvector] 只查分类「{}」（字段 {}）", category, filterKey);
-        return new FilterExpressionBuilder().eq(filterKey, category).build();
+        return keywordSearcher.search(query.text(), filter, pgVectorProperties.getKeyword().getTopK());
     }
 
     /**

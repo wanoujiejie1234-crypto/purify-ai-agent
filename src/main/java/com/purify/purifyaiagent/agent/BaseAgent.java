@@ -2,6 +2,7 @@ package com.purify.purifyaiagent.agent;
 
 import com.purify.purifyaiagent.agent.loop.LoopAction;
 import com.purify.purifyaiagent.agent.loop.LoopGuard;
+import com.purify.purifyaiagent.i18n.Messages;
 import lombok.extern.slf4j.Slf4j;
 import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Schedulers;
@@ -43,10 +44,13 @@ import java.util.Optional;
 @Slf4j
 public abstract class BaseAgent {
 
-    /** 步数用完后给用户的说明。 */
-    private static final String BUDGET_MESSAGE =
-            "这个任务我已经连着做了 %d 步还没收尾，先停在这里，免得一直耗下去。"
-                    + "你可以把要求说得更具体一点，或者把任务拆成几步，我接着做。";
+    /**
+     * 步数用完后给用户的说明，在 {@code messages*.properties} 里的键。
+     *
+     * <p>它是文案不是常量：这个循环的两种用法（SSE 和阻塞）都会把它发给用户看，
+     * 而语言得跟着这次 run 走。取的时候用 {@code run.i18n()}，不是 LocaleContextHolder。
+     */
+    private static final String BUDGET_MESSAGE_KEY = "agent.budgetExhausted";
 
     private final String name;
     private final int maxSteps;
@@ -73,9 +77,12 @@ public abstract class BaseAgent {
      * @param userId 发起这次 run 的用户 id。它和 {@code chatId} 都是不透明的字符串，
      *               <b>写反了能编译通过</b>，而表现是用户画像被存到了会话 id 上——
      *               所有调用点都要保持 {@code (chatId, userId, ...)} 这个顺序
+     * @param i18n   这次 run 用来跟用户说话的语言，**必须在请求线程上取好**。
+     *               参数顺序也是同样的道理：它和 {@code userId} 都是对象，
+     *               写反了能编译通过，表现是「英文用户收到中文的看门狗话术」
      */
-    public AgentResult runBlocking(String chatId, String userId, String input) {
-        AgentRun run = newRun(chatId, userId, input);
+    public AgentResult runBlocking(String chatId, String userId, Messages i18n, String input) {
+        AgentRun run = newRun(chatId, userId, i18n, input);
         execute(run).then().block();
         AgentResult result = run.toResult();
         log.info("[{}] 会话 {} 跑完：state={} 共 {} 步，循环命中 {} 次，答复={}",
@@ -89,8 +96,8 @@ public abstract class BaseAgent {
      * <p>模型调用也因此走流式（见 {@code ToolCallAgent#think}）——否则「流式」只是把一次
      * 算完的结果分段发出去，用户该等多久还是等多久。
      */
-    public Flux<AgentEvent> runStream(String chatId, String userId, String input) {
-        AgentRun run = newRun(chatId, userId, input);
+    public Flux<AgentEvent> runStream(String chatId, String userId, Messages i18n, String input) {
+        AgentRun run = newRun(chatId, userId, i18n, input);
         run.setStreaming(true);
         return execute(run)
                 // 整个循环挪到弹性线程池上跑，而不是留在订阅它的那个线程上。
@@ -127,16 +134,23 @@ public abstract class BaseAgent {
      * 但看门狗升级出来的提问（{@code AskUserLoopHandler}）不是模型说的，历史里没有。
      * 补上这段开场白之后，两条来路在模型眼里就一样了。
      */
-    private AgentRun newRun(String chatId, String userId, String input) {
+    private AgentRun newRun(String chatId, String userId, Messages i18n, String input) {
         String question = memory.takePendingQuestion(chatId);
-        return AgentRun.start(chatId, userId, withQuestion(input, question), memory.get(chatId));
+        return AgentRun.start(chatId, userId, i18n, withQuestion(i18n, input, question), memory.get(chatId));
     }
 
-    private static String withQuestion(String input, String question) {
+    /**
+     * 续跑时在用户那句话前面补一句上下文。
+     *
+     * <p>这段话是**发给模型的**，所以它也走语言包：英文用户回一句 "yes" 的时候，
+     * 模型不该看到一句中文的上下文交代——那会让它在两种语言之间反复横跳，
+     * 而它的回答语言本来就主要靠模仿上下文。
+     */
+    private static String withQuestion(Messages i18n, String input, String question) {
         if (question == null || question.isBlank()) {
             return input;
         }
-        return "（你上一轮向用户提了这个问题：「" + question + "」，下面是用户的回答）\n" + input;
+        return i18n.get("agent.answerPrefix", question, input);
     }
 
     /**
@@ -181,7 +195,7 @@ public abstract class BaseAgent {
                 log.info("[{}] 会话 {} 收尾：{}（{} 步）", name, run.chatId(), run.state(), run.stepCount());
                 return Flux.just(terminal);
             }
-            return Flux.just(AgentEvent.step(run.nextStepIndex()))
+            return Flux.just(AgentEvent.step(run))
                     .concatWith(step(run))
                     .concatWith(Flux.defer(() -> advance(run)))
                     .concatWith(Flux.defer(() -> loop(run)));
@@ -218,7 +232,7 @@ public abstract class BaseAgent {
         if (run.stepCount() >= maxSteps) {
             // 看门狗没吭声不代表没卡住——判据终究是有限条，而且模型完全可能每步都换着花样
             // 绕圈子。这是最后一道闸：跑到预算就收工，不留「无限循环」这个可能
-            String message = BUDGET_MESSAGE.formatted(maxSteps);
+            String message = run.i18n().get(BUDGET_MESSAGE_KEY, maxSteps);
             run.finish(AgentState.ABORTED, message);
             log.warn("[{}] 会话 {} 用完 {} 步预算，收工", name, run.chatId(), maxSteps);
             return Flux.just(AgentEvent.loopSignal(message));

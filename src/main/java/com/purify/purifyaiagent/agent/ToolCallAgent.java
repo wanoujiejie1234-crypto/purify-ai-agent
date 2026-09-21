@@ -25,7 +25,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.function.Supplier;
+import java.util.function.Function;
 
 /**
  * 会用工具的智能体：把 OpenManus 里 {@code ToolCallAgent} 的 think / act 两步搬了过来。
@@ -58,11 +58,14 @@ public class ToolCallAgent extends BaseAgent {
     private final ChatModel chatModel;
     private final ToolCallback[] toolCallbacks;
     private final ToolCallingManager toolCallingManager;
-    private final Supplier<String> systemPrompt;
+    private final Function<AgentRun, String> systemPrompt;
 
     /**
-     * @param systemPrompt 每次调用时现取系统提示词（用 Supplier 而不是 String：
-     *                     提示词里有「今天几号」这类每次都该重算的内容）
+     * @param systemPrompt 每次调用时现取系统提示词。收 {@link AgentRun} 而不是不收，
+     *                     是因为提示词有两处必须「现算」：一是有「今天几号」这类
+     *                     每次都该重算的内容，二是<b>它得跟着这次 run 的语言走</b>——
+     *                     中英文各一份模板（{@code purify-manus-system[-en].st}）。
+     *                     原先这里是个 {@code Supplier}，就是卡在拿不到 run 上。
      */
     public ToolCallAgent(String name,
                          int maxSteps,
@@ -71,7 +74,7 @@ public class ToolCallAgent extends BaseAgent {
                          ChatModel chatModel,
                          ToolCallback[] toolCallbacks,
                          ToolCallingManager toolCallingManager,
-                         Supplier<String> systemPrompt) {
+                         Function<AgentRun, String> systemPrompt) {
         super(name, maxSteps, loopGuard, memory);
         this.chatModel = chatModel;
         this.toolCallbacks = toolCallbacks.clone();
@@ -124,8 +127,9 @@ public class ToolCallAgent extends BaseAgent {
                 // 在这里转成 ERROR 终态，两条路的行为就一致了
                 .onErrorResume(error -> {
                     log.error("[{}] 模型调用失败", getName(), error);
+                    // 给用户看的话从 run 上取（这里在 Reactor 线程上，读不到请求语言）
                     run.finish(AgentState.ERROR,
-                            "抱歉，调用模型时出错了：" + rootMessage(error) + "。可以稍后再试一次。");
+                            run.i18n().get("agent.modelFailed", rootMessage(error)));
                     // 这里不再单独发一个 ERROR 事件：run 已经是终态，循环收尾时会把状态和说明
                     // 统一转成一个终态事件。两处都发的话，用户会连着收到两条一模一样的报错
                     return Flux.empty();
@@ -168,9 +172,10 @@ public class ToolCallAgent extends BaseAgent {
         catch (RuntimeException exception) {
             // 工具名对不上（模型幻觉出一个不存在的工具）、参数不是合法 JSON 都会在这里炸
             log.error("[{}] 工具执行失败", getName(), exception);
-            // 同上：交给循环收尾时统一转成终态事件，不在这里重复发一条
+            // 同上：交给循环收尾时统一转成终态事件，不在这里重复发一条。
+            // 文案同样从 run 上取
             run.finish(AgentState.ERROR,
-                    "抱歉，执行工具时出错了：" + rootMessage(exception) + "。可以换个说法再试一次。");
+                    run.i18n().get("agent.toolFailed", rootMessage(exception)));
             return Flux.empty();
         }
 
@@ -224,7 +229,9 @@ public class ToolCallAgent extends BaseAgent {
     }
 
     private String systemPrompt(AgentRun run) {
-        String base = this.systemPrompt.get();
+        // 每次调用都现渲染一次：语言和日期都可能和上一步不同（语言在一次 run 内不会变，
+        // 但日期跨零点会），而提示词本来就是要跟着这两样走的
+        String base = this.systemPrompt.apply(run);
         return run.hints().isEmpty() ? base : base + String.join("", run.hints());
     }
 

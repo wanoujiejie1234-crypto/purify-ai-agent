@@ -93,6 +93,25 @@
             <artifactId>aliyun-sdk-oss</artifactId>
             <version>3.18.2</version>
         </dependency>
+        <!--
+            百炼管控面 SDK：列出一个云知识库下的文件清单（ListIndexDocuments）与切片（ListChunks）。
+            知识库同步功能用，见 rag/bailian/BailianConsoleClient。
+
+            为什么不复用上面那个 aliyun-sdk-oss 就够了：两者不是一回事，而且恰好互不干扰。
+            OSS 那套是老的非 tea 栈（com.aliyun:aliyun-java-sdk-core / -ram / -kms），
+            管控面这套是 tea 栈（com.aliyun:tea / tea-openapi / tea-util / openapiutil）。
+            命名空间不相交，所以不会互相顶版本——这点是用 dependency:tree 核过的，不是推测。
+            反过来，哪天有人想把两处统一成一个 aliyun 依赖，那才会引入冲突。
+
+            认证也是另一套：这里走阿里云 AK/SK 签名，不是 DashScope 的 api-key。
+            配置在 purify.rag.bailian.* 下，刻意不和 aliyun.oss.* 共用——两者要的 RAM
+            权限点不同，共用会让「给 OSS 换个 AK」意外把百炼也换掉。
+        -->
+        <dependency>
+            <groupId>com.aliyun</groupId>
+            <artifactId>bailian20231229</artifactId>
+            <version>2.14.4</version>
+        </dependency>
         <!-- 对话记忆持久化：JDBC 仓储 + 数据源 -->
         <dependency>
             <groupId>org.springframework.ai</groupId>

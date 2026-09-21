@@ -1,14 +1,15 @@
 package com.purify.purifyaiagent.tools;
 
 import cn.hutool.core.io.FileUtil;
+import com.purify.purifyaiagent.constant.FileConstant;
+import com.purify.purifyaiagent.resource.ResourceKind;
+import com.purify.purifyaiagent.resource.ResourceRecorder;
+import org.springframework.ai.chat.model.ToolContext;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.util.StringUtils;
 
 import java.nio.file.Path;
-import java.nio.file.Paths;
-
-import static com.purify.purifyaiagent.constant.FileConstant.FILE_SAVE_DIR;
 
 /**
  * 让模型能读写本地文件，用来存草稿、把长内容先落盘再看。
@@ -19,11 +20,24 @@ import static com.purify.purifyaiagent.constant.FileConstant.FILE_SAVE_DIR;
  */
 public class FileOperationTool {
 
-    /** 文件都放在 tmp 下的 file 子目录，不和下载目录混在一起。 */
-    private static final String FILE_DIR = FILE_SAVE_DIR + "/file";
+    /**
+     * 文件都放在 tmp 下的 file 子目录，不和下载目录混在一起。
+     *
+     * <p>常量定义搬到了 {@link FileConstant#WORK_FILE_DIR}：资料库那边删除文件时
+     * 也要知道这个目录，两处各写一份的话，改了一处就会出现「记录删了但文件还留着」
+     * 这种不报错的问题。
+     */
+    private static final String FILE_DIR = FileConstant.WORK_FILE_DIR;
 
     /** 文件名清洗后什么都不剩时用它，避免拼出一个以 {@code /} 结尾的目录路径。 */
     private static final String DEFAULT_FILE_NAME = "untitled.txt";
+
+    /** 写好之后往资料库记一笔。见 {@code ResourceRecorder}——它不抛异常，不会拖累本工具。 */
+    private final ResourceRecorder resourceRecorder;
+
+    public FileOperationTool(ResourceRecorder resourceRecorder) {
+        this.resourceRecorder = resourceRecorder;
+    }
 
     @Tool(description = "读取之前用 writeFile 保存过的文件内容。"
             + "只接受文件名，不要带路径，文件都存放在服务端固定的一个目录里。")
@@ -43,16 +57,26 @@ public class FileOperationTool {
     }
 
     @Tool(description = "把内容写成一个文件保存下来，之后可以用 readFile 读回来。"
-            + "只接受文件名，不要带路径；同名文件会被直接覆盖。")
+            + "只接受文件名，不要带路径；同名文件会被直接覆盖。"
+            + "写出来之后用户可以在这里的「资料库」里找到它。")
     public String writeFile(@ToolParam(description = "文件名，例如 diet-plan.md，不要带路径") String fileName,
-                            @ToolParam(description = "要写入的完整内容") String content) {
+                            @ToolParam(description = "要写入的完整内容") String content,
+                            ToolContext toolContext) {
         String path = pathOf(fileName);
         try {
             // 目录只在第一次写入时创建。放在 try 里是因为它也可能失败——
             // 磁盘满、没权限都会在这一步炸，一起兜住比让它冒到模型那里好
             FileUtil.mkdir(FILE_DIR);
             FileUtil.writeUtf8String(content == null ? "" : content, path);
-            return "已写入：" + path + "（" + FileUtil.size(Path.of(path).toFile()) + " 字节）";
+
+            long size = FileUtil.size(Path.of(path).toFile());
+            // url 传 null：这个目录故意没有对外映射（见 FileConstant#WORK_FILE_DIR），
+            // 所以界面上那一条会走带鉴权的下载接口，而不是一个裸链接
+            resourceRecorder.record(toolContext, ResourceKind.WRITTEN,
+                    Path.of(path).getFileName().toString(),
+                    null, Path.of(path).getFileName().toString(), size, null, null);
+
+            return "已写入：" + path + "（" + size + " 字节）";
         } catch (Exception exception) {
             return "写入文件失败：" + exception.getMessage();
         }

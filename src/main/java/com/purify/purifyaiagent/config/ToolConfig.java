@@ -1,6 +1,8 @@
 package com.purify.purifyaiagent.config;
 
+import com.purify.purifyaiagent.profile.ProfileService;
 import com.purify.purifyaiagent.profile.UserProfileRepository;
+import com.purify.purifyaiagent.resource.ResourceRecorder;
 import com.purify.purifyaiagent.tools.AgentToolRegistry;
 import com.purify.purifyaiagent.tools.FileOperationTool;
 import com.purify.purifyaiagent.tools.PDFGenerationTool;
@@ -59,14 +61,26 @@ public class ToolConfig {
         return new UserProfileRepository(jdbcTemplate);
     }
 
+    /**
+     * 画像的读写规则。
+     *
+     * <p>单独成 Bean 是因为它有**两个调用方**：这里的工具，和设置页的
+     * {@code ProfileController}。规则（先读再合并、体重变了才记流水）只写一遍，
+     * 两个入口才不会慢慢走偏。
+     */
     @Bean
-    public UserProfileTool userProfileTool(UserProfileRepository userProfileRepository) {
-        return new UserProfileTool(userProfileRepository);
+    public ProfileService profileService(UserProfileRepository userProfileRepository) {
+        return new ProfileService(userProfileRepository);
     }
 
     @Bean
-    public FileOperationTool fileOperationTool() {
-        return new FileOperationTool();
+    public UserProfileTool userProfileTool(ProfileService profileService) {
+        return new UserProfileTool(profileService);
+    }
+
+    @Bean
+    public FileOperationTool fileOperationTool(ResourceRecorder resourceRecorder) {
+        return new FileOperationTool(resourceRecorder);
     }
 
     @Bean
@@ -76,8 +90,9 @@ public class ToolConfig {
 
     /** 下载工具要回一个能点开的链接，前缀只能从配置里拿（工具不在 HTTP 请求上下文里）。 */
     @Bean
-    public ResourceDownloadTool resourceDownloadTool(ServerProperties serverProperties) {
-        return new ResourceDownloadTool(serverProperties.getBaseUrl());
+    public ResourceDownloadTool resourceDownloadTool(ServerProperties serverProperties,
+                                                     ResourceRecorder resourceRecorder) {
+        return new ResourceDownloadTool(serverProperties.getBaseUrl(), resourceRecorder);
     }
 
     /**
@@ -88,8 +103,9 @@ public class ToolConfig {
      * 客户端本身是懒创建的，所以「建了但没用」不会有任何网络开销。
      */
     @Bean
-    public PDFGenerationTool pdfGenerationTool(AliyunOssProperties aliyunOssProperties) {
-        return new PDFGenerationTool(aliyunOssProperties);
+    public PDFGenerationTool pdfGenerationTool(AliyunOssProperties aliyunOssProperties,
+                                               ResourceRecorder resourceRecorder) {
+        return new PDFGenerationTool(aliyunOssProperties, resourceRecorder);
     }
 
     /**

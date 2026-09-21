@@ -28,6 +28,21 @@ import org.springframework.http.HttpStatus;
  * <p>与 {@link SensitiveWordException} 的关系：<b>是兄弟，不是父子</b>。
  * 那个返回的是 HTTP 200 + 引导话术（「命中敏感词」是业务上的主动拒绝，不是错误），
  * 一旦让它继承本类，它就会被 400 的那条分支抢走处理权。
+ *
+ * <h2>message 是「键」不是「句子」</h2>
+ *
+ * <p>从接入中英双语起，工厂方法的第一个参数是 {@code messages*.properties} 里的<b>键</b>，
+ * 后面跟的 {@code args} 填进文案里的 {0} {1}。真正翻成人话发生在
+ * {@code GlobalExceptionHandler} 里（那里有 {@code MessageSource} 和当前请求的语言）。
+ *
+ * <p>为什么不在这里就把句子拼好：拼的时候<b>拿不到语言</b>。异常是在业务代码深处
+ * new 出来的，那些地方既不在请求线程上（智能体的循环跑在 Reactor 线程上），
+ * 也不该为了取一句文案去依赖 {@code MessageSource}。
+ * 换成键 + 参数之后，这个异常本身是语言无关的，翻不翻、翻成哪种语言，
+ * 由处理它的那一层决定。
+ *
+ * <p>{@code getMessage()} 因此返回的是<b>键</b>，仅供日志定位用。
+ * 需要给人看的文案请走 {@code GlobalExceptionHandler}——它会先翻译再记日志。
  */
 @Getter
 public class ApiException extends RuntimeException {
@@ -72,6 +87,23 @@ public class ApiException extends RuntimeException {
     private final String code;
 
     /**
+     * 文案在 {@code messages*.properties} 里的键，**不是**给用户看的那句话。
+     *
+     * <p>{@code super(message)} 传的也是它，于是 {@code getMessage()} 拿到的是键 ——
+     * 这是有意的：日志里出现 {@code error.auth.badCredentials} 一眼就能定位到是哪条分支，
+     * 而一句翻好的中文既没法反查、也没法知道它属于哪个码。
+     */
+    private final String messageKey;
+
+    /**
+     * 填进文案占位符的参数，顺序对应 {@code {0} {1}}。
+     *
+     * <p>用 {@code Object...} 而不是提前拼成字符串：拼了就又变成语言相关的了
+     * （「还可以试 3 次」和 "3 attempt(s) left" 里数字的位置不一样）。
+     */
+    private final Object[] args;
+
+    /**
      * HTTP 状态码。绝大多数情况是 400，只有 {@link #notFound} 用 404。
      *
      * <p><b>为什么最后还是给它加了个状态字段</b>：原来的设计是「这一类比全都是
@@ -85,13 +117,16 @@ public class ApiException extends RuntimeException {
      */
     private final HttpStatus status;
 
-    private ApiException(String code, String message) {
-        this(code, message, HttpStatus.BAD_REQUEST);
+    private ApiException(String code, String messageKey, Object[] args) {
+        this(code, messageKey, args, HttpStatus.BAD_REQUEST);
     }
 
-    private ApiException(String code, String message, HttpStatus status) {
-        super(message);
+    private ApiException(String code, String messageKey, Object[] args, HttpStatus status) {
+        // 传键本身而不是翻好的句子，见类注释。日志里因此看到的是键
+        super(messageKey);
         this.code = code;
+        this.messageKey = messageKey;
+        this.args = args == null ? new Object[0] : args;
         this.status = status;
     }
 
@@ -99,9 +134,11 @@ public class ApiException extends RuntimeException {
      * 图片不合法。
      *
      * <p>与其把不确定的字节流发给模型让它瞎猜（还照样计费），不如在入口就直接挡掉。
+     *
+     * @param messageKey {@code messages*.properties} 里的键，不是给用户看的句子
      */
-    public static ApiException invalidImage(String message) {
-        return new ApiException(INVALID_IMAGE, message);
+    public static ApiException invalidImage(String messageKey, Object... args) {
+        return new ApiException(INVALID_IMAGE, messageKey, args);
     }
 
     /**
@@ -110,33 +147,33 @@ public class ApiException extends RuntimeException {
      * <p>挡在这里而不是让空消息走到模型那一层：DashScope 对空输入会报一个含义模糊的
      * 参数错误，看起来像服务端故障；而「你没说话」本来就该是一个 400。
      */
-    public static ApiException invalidChatRequest(String message) {
-        return new ApiException(INVALID_CHAT_REQUEST, message);
+    public static ApiException invalidChatRequest(String messageKey, Object... args) {
+        return new ApiException(INVALID_CHAT_REQUEST, messageKey, args);
     }
 
     /** 文档在入口处被拒：还没开始解析就能判定它不该被收下。 */
-    public static ApiException unsupportedDocument(String message) {
-        return new ApiException(UNSUPPORTED_DOCUMENT, message);
+    public static ApiException unsupportedDocument(String messageKey, Object... args) {
+        return new ApiException(UNSUPPORTED_DOCUMENT, messageKey, args);
     }
 
     /** 文档收下了，但解析/切片/写入做不下去。 */
-    public static ApiException documentIndexFailed(String message) {
-        return new ApiException(DOCUMENT_INDEX_FAILED, message);
+    public static ApiException documentIndexFailed(String messageKey, Object... args) {
+        return new ApiException(DOCUMENT_INDEX_FAILED, messageKey, args);
     }
 
     /**
      * 注册/找回密码的输入不合法。
      *
-     * <p>{@code message} 会被原样显示给用户，所以它是写给用户看的——
+     * <p>键指向的那句话会被原样显示给用户，所以它是写给用户看的——
      * 别写「唯一索引冲突」这种内部说法，写「这个用户名已经被占用了」。
      */
-    public static ApiException authInvalid(String message) {
-        return new ApiException(AUTH_INVALID, message);
+    public static ApiException authInvalid(String messageKey, Object... args) {
+        return new ApiException(AUTH_INVALID, messageKey, args);
     }
 
-    /** 验证码要得太频繁。消息里要带上还剩几秒，前端拿它做倒计时。 */
-    public static ApiException codeTooFrequent(String message) {
-        return new ApiException(CODE_TOO_FREQUENT, message);
+    /** 验证码要得太频繁。文案里要带上还剩几秒，前端拿它做倒计时。 */
+    public static ApiException codeTooFrequent(String messageKey, Object... args) {
+        return new ApiException(CODE_TOO_FREQUENT, messageKey, args);
     }
 
     /**
@@ -148,10 +185,12 @@ public class ApiException extends RuntimeException {
      * 『这个 ID 是存在的，只是不属于你』的信息泄露口子」），这里只是把它
      * 扩展到读取路径上。
      *
-     * <p>{@code message} 也要统一（见 {@code SessionAccess} 里的常量），
-     * 否则光靠错别字就能把两种情况分辨出来。
+     * <p>{@code messageKey} 也要统一（见 {@code SessionAccess} 里的常量），
+     * 否则光靠错别字就能把两种情况分辨出来。两种语言下各自统一即可——
+     * 中英各有一句，但只要前端始终带着 {@code Accept-Language}，
+     * 同一个请求里的两次响应就一定是同一种语言，仍然分不出来。
      */
-    public static ApiException notFound(String message) {
-        return new ApiException(NOT_FOUND, message, HttpStatus.NOT_FOUND);
+    public static ApiException notFound(String messageKey, Object... args) {
+        return new ApiException(NOT_FOUND, messageKey, args, HttpStatus.NOT_FOUND);
     }
 }

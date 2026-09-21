@@ -9,16 +9,24 @@ import {
   deleteDocument,
   searchKnowledge,
 } from '../api/http.js'
+import BailianSyncCard from '../components/BailianSyncCard.vue'
+import { isEnglish, message, rawMessage, resolveMessage, t } from '../i18n/index.js'
 
 /**
  * 知识库管理页 —— RAG 第一阶段（离线索引）的界面。
  *
- * 三块：
+ * 五块：
  *   1. 概览：切片总数、文档份数、分类分布
- *   2. 文档列表：逐份的切片数 / 分类 / 入库时间，可以删
- *   3. 检索自检：拿一句话真跑一次检索，看知识库到底能查出什么
+ *   2. 上传建索引：本地文件 → 本地切片 → 入库
+ *   3. 百炼同步：百炼云知识库**已经切好的**切片 → 入库（切片不重切，见那个组件）
+ *   4. 文档列表：逐份的切片数 / 分类 / 入库时间，可以删
+ *   5. 检索自检：拿一句话真跑一次检索，看知识库到底能查出什么
  *
- * 第三块不是可有可无的。检索是「悄悄发生」的 —— 命中也好、没查也好，
+ * 第二块和第三块是同一件事的两个入口（往本地向量库里灌数据），只是数据来源不同：
+ * 一个传本地文件、用本地的 TokenTextSplitter 切；一个搬百炼那边已经切好的。
+ * 所以它们在页面上挨着 —— 用户要选的就是「这份文档的切片从哪来」。
+ *
+ * 第五块不是可有可无的。检索是「悄悄发生」的 —— 命中也好、没查也好，
  * 在聊天界面上看都是「模型开始回答了」。答得不对的时候，「知识库没召回到」和
  * 「压根没查」的排查方向完全不同，靠这个面板才能分开。
  */
@@ -27,7 +35,12 @@ import {
 
 // 和后端 purify.rag.router.categories 里的 value 必须一字不差，
 // 后端会拦下不认识的值。这里写死一份是有意的：改成从接口拉，就得先有接口，
-// 而分类表本来就是配置里的静态数据，改它的时候两边一起改更省事
+// 而分类表本来就是配置里的静态数据，改它的时候两边一起改更省事。
+//
+// **这三个值不翻译，界面上也是原样显示。** 它们不是「中文文案」，是数据：
+// 写进了 pgvector 的元数据、还被当作等值过滤条件用，翻掉之后已经入库的文档
+// 一份都检索不到——而界面上看不出任何异常，这比报错难查得多。
+// 所以下面 <option> 里没有第二个值可以给，不要在这里做「显示一份、发送一份」。
 const CATEGORIES = ['食物热量', '运动热量', '药物']
 
 const classification = ref(CATEGORIES[0])
@@ -35,14 +48,17 @@ const classification = ref(CATEGORIES[0])
 /* ------------------------------------------------------------------ 概览 */
 
 const stats = ref(null)
-const statsError = ref('')
+/** 各处的报错都存描述符不存句子，见 i18n/index.js 的 message()：存句子的话切语言不会跟着变 */
+const statsError = ref(null)
+
+const statsErrorText = computed(() => resolveMessage(statsError.value))
 
 async function loadStats() {
   try {
     stats.value = await fetchKnowledgeStats()
-    statsError.value = ''
+    statsError.value = null
   } catch (err) {
-    statsError.value = err.message || '读取概览失败'
+    statsError.value = err.message ? rawMessage(err.message) : message('knowledge.overview.loadFailed')
   }
 }
 
@@ -57,8 +73,10 @@ const docs = ref([])
 const page = ref(1)
 const size = 10
 const total = ref(0)
-const docsError = ref('')
+const docsError = ref(null)
 const loadingDocs = ref(false)
+
+const docsErrorText = computed(() => resolveMessage(docsError.value))
 
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / size)))
 
@@ -68,9 +86,9 @@ async function loadDocuments() {
     const data = await fetchKnowledgeDocuments(page.value, size)
     docs.value = data?.items || []
     total.value = data?.total || 0
-    docsError.value = ''
+    docsError.value = null
   } catch (err) {
-    docsError.value = err.message || '读取文档列表失败'
+    docsError.value = err.message ? rawMessage(err.message) : message('knowledge.docs.loadFailed')
   } finally {
     loadingDocs.value = false
   }
@@ -87,7 +105,7 @@ async function refreshAll() {
 }
 
 async function remove(source) {
-  if (!window.confirm(`删除「${source}」的全部切片？`)) return
+  if (!window.confirm(t('knowledge.docs.deleteConfirm', { source }))) return
   try {
     await deleteDocument(source)
     // 删完可能这一页就空了，往回退一页 —— 否则用户会看到一个空列表，
@@ -95,15 +113,34 @@ async function remove(source) {
     if (docs.value.length === 1 && page.value > 1) page.value -= 1
     await refreshAll()
   } catch (err) {
-    docsError.value = err.message || '删除失败'
+    docsError.value = err.message ? rawMessage(err.message) : message('knowledge.docs.deleteFailed')
   }
 }
 
 /* ------------------------------------------------------------------ 上传 */
 
 const uploading = ref(false)
-const uploadMessage = ref('')
-const uploadError = ref('')
+/**
+ * 这两条都是**拼接出来的**结果文案（带文件名、切片数），所以它们存的是
+ * 「键 + 参数」而不是句子——切语言时按新语言重拼一遍。
+ * 直接存拼好的字符串的话，用户切完语言这里会是一句中英混排：
+ * 数字是新的、模板是旧的。
+ */
+const uploadMessage = ref(null)
+/**
+ * 报错存的是**一组**描述符而不是一句拼好的话。
+ *
+ * 批量导入失败时会一次列出好几条原因，拼成一句存下来的话，切语言之后
+ * 那一句里每个模板都已经冻在旧语言里了。存列表、渲染时逐条翻再拼起来，
+ * 才能整句跟着语言走。分隔符也跟着语言走（中文用「；」，英文用「; 」）。
+ */
+const uploadError = ref([])
+
+const uploadMessageText = computed(() => resolveMessage(uploadMessage.value))
+const uploadErrorText = computed(() => {
+  const separator = isEnglish() ? '; ' : '；'
+  return uploadError.value.map(resolveMessage).join(separator)
+})
 
 async function onFiles(event) {
   const files = Array.from(event.target.files || [])
@@ -112,26 +149,36 @@ async function onFiles(event) {
   event.target.value = ''
 
   uploading.value = true
-  uploadMessage.value = ''
-  uploadError.value = ''
+  uploadMessage.value = null
+  uploadError.value = []
   try {
     if (files.length === 1) {
       const result = await uploadDocument(files[0], classification.value)
-      uploadMessage.value = `「${result.source}」已入库：${result.chunkCount} 个切片`
+      uploadMessage.value = message('knowledge.upload.single', {
+        source: result.source,
+        count: result.chunkCount,
+      })
     } else {
       const result = await uploadDocuments(files, classification.value)
-      uploadMessage.value = `导入完成：成功 ${result.succeeded} 份，失败 ${result.failed} 份`
+      uploadMessage.value = message('knowledge.upload.batch', {
+        ok: result.succeeded,
+        failed: result.failed,
+      })
       // 有失败就把原因摆出来，不要只报一个数字 ——
-      // 「3 份失败」对排查毫无帮助，而失败原因往往一眼就能看懂（格式不对、编码不对）
+      // 「3 份失败」对排查毫无帮助，而失败原因往往一眼就能看懂（格式不对、编码不对）。
+      // 这里存的是**一组**描述符，所以单独包一层：resolveMessage 只认单个
       const failures = (result.items || []).filter((i) => !i.ok)
-      if (failures.length) {
-        uploadError.value = failures.map((i) => `${i.filename}：${i.message}`).join('；')
-      }
+      // i.message 是后端按 Accept-Language 翻好的一句结论（「不是 UTF-8」之类），
+      // 前端手里没有它的键，所以这里用的是 message() 里 text 那一支
+      uploadError.value = failures.map((i) =>
+        message('knowledge.upload.failureItem', { name: i.filename, message: i.message }),
+      )
     }
     page.value = 1
     await refreshAll()
   } catch (err) {
-    uploadError.value = err.message || '上传失败'
+    // 整批失败（网络、超时）：只有一句话
+    uploadError.value = [err.message ? rawMessage(err.message) : message('knowledge.upload.failed')]
   } finally {
     uploading.value = false
   }
@@ -141,7 +188,9 @@ async function onFiles(event) {
 
 const previewing = ref(false)
 const preview = ref(null)
-const previewError = ref('')
+const previewError = ref(null)
+
+const previewErrorText = computed(() => resolveMessage(previewError.value))
 
 async function onPreviewFile(event) {
   const file = (event.target.files || [])[0]
@@ -150,11 +199,11 @@ async function onPreviewFile(event) {
 
   previewing.value = true
   preview.value = null
-  previewError.value = ''
+  previewError.value = null
   try {
     preview.value = await previewDocument(file, classification.value)
   } catch (err) {
-    previewError.value = err.message || '预览失败'
+    previewError.value = err.message ? rawMessage(err.message) : message('knowledge.preview.failed')
   } finally {
     previewing.value = false
   }
@@ -165,18 +214,34 @@ async function onPreviewFile(event) {
 const query = ref('')
 const searching = ref(false)
 const searchResult = ref(null)
-const searchError = ref('')
+const searchError = ref(null)
+
+const searchErrorText = computed(() => resolveMessage(searchError.value))
+
+/** 「命中 N 条，耗时 Xms，分类过滤：…」那一整句，按当前语言拼。 */
+const searchVerdict = computed(() => {
+  const result = searchResult.value
+  if (!result) return null
+  const categories = result.categories?.length
+    ? result.categories.join(isEnglish() ? ', ' : '、')
+    : t('knowledge.search.allCategories')
+  return {
+    count: result.count,
+    elapsed: result.elapsedMs,
+    categories,
+  }
+})
 
 async function runSearch() {
   const q = query.value.trim()
   if (!q || searching.value) return
   searching.value = true
-  searchError.value = ''
+  searchError.value = null
   try {
     searchResult.value = await searchKnowledge(q)
   } catch (err) {
     searchResult.value = null
-    searchError.value = err.message || '检索失败'
+    searchError.value = err.message ? rawMessage(err.message) : message('knowledge.search.failed')
   } finally {
     searching.value = false
   }
@@ -188,28 +253,28 @@ onMounted(refreshAll)
 <template>
   <div class="page">
     <header class="bar">
-      <RouterLink to="/" class="back" title="返回主页">
+      <RouterLink to="/" class="back" :title="$t('knowledge.backHome')">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <path d="M15 18l-6-6 6-6" />
         </svg>
       </RouterLink>
-      <h1>知识库</h1>
-      <button class="ghost" type="button" @click="refreshAll">刷新</button>
+      <h1>{{ $t('knowledge.title') }}</h1>
+      <button class="ghost" type="button" @click="refreshAll">{{ $t('common.refresh') }}</button>
     </header>
 
     <main class="body">
       <!-- ======================= 概览 ======================= -->
       <section class="card">
-        <h2>概览</h2>
-        <p v-if="statsError" class="err">{{ statsError }}</p>
+        <h2>{{ $t('knowledge.overview.title') }}</h2>
+        <p v-if="statsErrorText" class="err">{{ statsErrorText }}</p>
         <div v-else-if="stats" class="metrics">
           <div class="metric">
             <span class="num">{{ stats.totalChunks }}</span>
-            <span class="label">切片总数</span>
+            <span class="label">{{ $t('knowledge.overview.chunks') }}</span>
           </div>
           <div class="metric">
             <span class="num">{{ stats.documentCount }}</span>
-            <span class="label">文档份数</span>
+            <span class="label">{{ $t('knowledge.overview.documents') }}</span>
           </div>
         </div>
         <div v-if="distribution.length" class="dist">
@@ -220,27 +285,29 @@ onMounted(refreshAll)
         <!-- 切片总数为 0 是最值得点名的一种状态：检索查不到东西时，
              第一个要排除的就是「库里根本没有数据」 -->
         <p v-if="stats && !stats.totalChunks" class="warn">
-          知识库还是空的。上传几份文档之后，对话才会开始查它。
+          {{ $t('knowledge.overview.empty') }}
         </p>
       </section>
 
       <!-- ======================= 上传 ======================= -->
       <section class="card">
-        <h2>上传建索引</h2>
+        <h2>{{ $t('knowledge.upload.title') }}</h2>
         <p class="desc">
-          支持 txt / md。同一文件名重复上传会覆盖旧切片。选一整个目录可以批量导入。
+          {{ $t('knowledge.upload.desc') }}
         </p>
 
         <div class="row">
           <label class="field">
-            分类
+            {{ $t('knowledge.upload.category') }}
+            <!-- 这一列**不翻译**：它的值要和后端 purify.rag.router.categories 一字不差，
+                 翻了已入库的文档全都检索不到。理由写在上面 CATEGORIES 那里 -->
             <select v-model="classification">
               <option v-for="c in CATEGORIES" :key="c" :value="c">{{ c }}</option>
             </select>
           </label>
 
           <label class="btn" :class="{ disabled: uploading }">
-            {{ uploading ? '处理中…' : '选择文件' }}
+            {{ uploading ? $t('knowledge.upload.processing') : $t('knowledge.upload.pick') }}
             <input type="file" accept=".txt,.md,.markdown" multiple :disabled="uploading" @change="onFiles" />
           </label>
 
@@ -248,7 +315,7 @@ onMounted(refreshAll)
                不能再多选散文件，两者是互斥的两种选择方式，硬塞进一个框会顾此失彼。
                非 Chrome/Edge 浏览器会忽略这个属性，退化成普通多选，不影响可用性 -->
           <label class="btn subtle" :class="{ disabled: uploading }">
-            {{ uploading ? '处理中…' : '导入整个目录' }}
+            {{ uploading ? $t('knowledge.upload.processing') : $t('knowledge.upload.pickDir') }}
             <input
               type="file"
               accept=".txt,.md,.markdown"
@@ -260,55 +327,65 @@ onMounted(refreshAll)
           </label>
 
           <label class="btn subtle" :class="{ disabled: previewing }">
-            {{ previewing ? '预览中…' : '预览切片' }}
+            {{ previewing ? $t('knowledge.upload.previewing') : $t('knowledge.upload.preview') }}
             <input type="file" accept=".txt,.md,.markdown" :disabled="previewing" @change="onPreviewFile" />
           </label>
         </div>
 
-        <p v-if="uploadMessage" class="ok">{{ uploadMessage }}</p>
-        <p v-if="uploadError" class="err">{{ uploadError }}</p>
-        <p v-if="previewError" class="err">{{ previewError }}</p>
+        <p v-if="uploadMessageText" class="ok">{{ uploadMessageText }}</p>
+        <p v-if="uploadErrorText" class="err">{{ uploadErrorText }}</p>
+        <p v-if="previewErrorText" class="err">{{ previewErrorText }}</p>
 
         <!-- 预览结果 -->
         <div v-if="preview" class="preview">
           <h3>
-            预览：{{ preview.source }} → 会切成 {{ preview.chunkCount }} 片，共
-            {{ preview.characters }} 字符
+            {{ $t('knowledge.preview.heading', {
+              source: preview.source,
+              count: preview.chunkCount,
+              chars: preview.characters,
+            }) }}
           </h3>
-          <p v-if="preview.truncated" class="desc">下面只列了前 {{ preview.chunks.length }} 片。</p>
+          <p v-if="preview.truncated" class="desc">
+            {{ $t('knowledge.preview.truncated', { count: preview.chunks.length }) }}
+          </p>
           <ul class="chunks">
             <li v-for="c in preview.chunks" :key="c.index">
               <span class="idx">#{{ c.index }}</span>
-              <span class="len">{{ c.length }} 字</span>
+              <span class="len">{{ $t('knowledge.preview.chars', { n: c.length }) }}</span>
               <span class="excerpt">{{ c.excerpt }}</span>
             </li>
           </ul>
         </div>
       </section>
 
+      <!-- ====================== 百炼同步 ======================
+           紧挨着上传卡片：两者都是「往本地向量库里灌数据」，只是数据来源不同。
+           同步完刷新页面上的统计与文档列表 —— 那些数字刚变了 -->
+      <BailianSyncCard @synced="refreshAll" />
+
       <!-- ======================= 文档列表 ======================= -->
       <section class="card">
         <div class="card-head">
-          <h2>文档（{{ total }}）</h2>
+          <h2>{{ $t('knowledge.docs.title', { n: total }) }}</h2>
           <div class="pager" v-if="totalPages > 1">
-            <button type="button" :disabled="page <= 1" @click="goto(page - 1)">上一页</button>
+            <button type="button" :disabled="page <= 1" @click="goto(page - 1)">{{ $t('knowledge.docs.prev') }}</button>
             <span>{{ page }} / {{ totalPages }}</span>
-            <button type="button" :disabled="page >= totalPages" @click="goto(page + 1)">下一页</button>
+            <button type="button" :disabled="page >= totalPages" @click="goto(page + 1)">{{ $t('knowledge.docs.next') }}</button>
           </div>
         </div>
 
-        <p v-if="docsError" class="err">{{ docsError }}</p>
-        <p v-else-if="loadingDocs" class="desc">读取中…</p>
-        <p v-else-if="!docs.length" class="desc">还没有文档。</p>
+        <p v-if="docsErrorText" class="err">{{ docsErrorText }}</p>
+        <p v-else-if="loadingDocs" class="desc">{{ $t('knowledge.docs.loading') }}</p>
+        <p v-else-if="!docs.length" class="desc">{{ $t('knowledge.docs.empty') }}</p>
 
         <table v-else class="docs">
           <thead>
             <tr>
-              <th>来源</th>
-              <th>分类</th>
-              <th class="num-col">切片</th>
-              <th class="num-col">字符</th>
-              <th>入库时间</th>
+              <th>{{ $t('knowledge.docs.source') }}</th>
+              <th>{{ $t('knowledge.docs.category') }}</th>
+              <th class="num-col">{{ $t('knowledge.docs.chunks') }}</th>
+              <th class="num-col">{{ $t('knowledge.docs.characters') }}</th>
+              <th>{{ $t('knowledge.docs.uploadedAt') }}</th>
               <th></th>
             </tr>
           </thead>
@@ -320,7 +397,7 @@ onMounted(refreshAll)
               <td class="num-col">{{ d.characters }}</td>
               <td class="time">{{ (d.uploadedAt || '').replace('T', ' ').slice(0, 19) }}</td>
               <td>
-                <button type="button" class="del" @click="remove(d.source)">删除</button>
+                <button type="button" class="del" @click="remove(d.source)">{{ $t('common.delete') }}</button>
               </td>
             </tr>
           </tbody>
@@ -329,44 +406,61 @@ onMounted(refreshAll)
 
       <!-- ====================== 检索自检 ====================== -->
       <section class="card">
-        <h2>检索自检</h2>
+        <h2>{{ $t('knowledge.search.title') }}</h2>
         <p class="desc">
-          拿一句话真跑一次检索，看看会不会查、查出什么、以及最终会拼进 Prompt 的原文。
-          这个操作只读，可以随便试。
+          {{ $t('knowledge.search.desc') }}
         </p>
 
         <form class="search" @submit.prevent="runSearch">
-          <input v-model="query" type="text" placeholder="例如：一碗米饭的热量是多少千卡" />
+          <input v-model="query" type="text" :placeholder="$t('knowledge.search.placeholder')" />
           <button type="submit" :disabled="searching || !query.trim()">
-            {{ searching ? '检索中…' : '检索' }}
+            {{ searching ? $t('knowledge.search.running') : $t('knowledge.search.submit') }}
           </button>
         </form>
 
-        <p v-if="searchError" class="err">{{ searchError }}</p>
+        <p v-if="searchErrorText" class="err">{{ searchErrorText }}</p>
 
         <template v-if="searchResult">
           <div class="verdict" :class="{ skip: !searchResult.retrieved }">
             <template v-if="!searchResult.retrieved">
-              <b>没有发起检索</b> —— 路由判定这句话与知识库无关。这是「压根没查」，
-              不是「查了没命中」。想让这类问题也走检索，把
-              <code>purify.rag.router.query-all-when-unmatched</code> 改成 true。
+              <b>{{ $t('knowledge.search.skipped') }}</b>{{ $t('knowledge.search.skippedDetail') }}
             </template>
             <template v-else>
-              <b>已检索</b>：命中 {{ searchResult.count }} 条，耗时 {{ searchResult.elapsedMs }}ms，
-              分类过滤：{{ searchResult.categories?.length ? searchResult.categories.join('、') : '全库' }}
+              <b>{{ $t('knowledge.search.retrieved') }}</b>
+              {{ $t('knowledge.search.retrievedDetail', searchVerdict) }}
             </template>
           </div>
+
+          <!-- 关键词那一路的状态。
+               「它有没有在工作」「它把问题拆成了什么」这两件事都不会报错，
+               只会让召回悄悄变差——所以必须显式显示出来 -->
+          <p v-if="searchResult.keyword && !searchResult.keyword.available" class="warn">
+            {{ $t('knowledge.search.keywordUnavailable', { reason: searchResult.keyword.reason }) }}
+          </p>
+          <p v-else-if="searchResult.keyword?.terms?.length" class="terms">
+            {{
+              $t('knowledge.search.keywordTerms', {
+                terms: searchResult.keyword.terms.join(isEnglish() ? ', ' : '、'),
+              })
+            }}
+          </p>
 
           <ul v-if="searchResult.chunks?.length" class="chunks">
             <li v-for="c in searchResult.chunks" :key="c.index">
               <span class="idx">[{{ c.index }}]</span>
               <span class="len">{{ c.docName }}<template v-if="c.score != null"> · {{ c.score.toFixed(3) }}</template></span>
+              <!-- 两路各自排第几。两个一起看就能回答「这条为什么排在这儿」：
+                   两路都命中却排在只被一路命中的后面，那才是融合出了问题 -->
+              <span v-if="c.vectorRank != null || c.keywordRank != null" class="ranks">
+                <span v-if="c.vectorRank != null">{{ $t('knowledge.search.rankVector', { n: c.vectorRank }) }}</span>
+                <span v-if="c.keywordRank != null">{{ $t('knowledge.search.rankKeyword', { n: c.keywordRank }) }}</span>
+              </span>
               <span class="excerpt">{{ c.excerpt }}</span>
             </li>
           </ul>
 
           <details v-if="searchResult.referenceText" class="raw">
-            <summary>会拼进 Prompt 的原文</summary>
+            <summary>{{ $t('knowledge.search.rawSummary') }}</summary>
             <pre>{{ searchResult.referenceText }}</pre>
           </details>
         </template>
@@ -621,6 +715,28 @@ onMounted(refreshAll)
 }
 .excerpt {
   overflow-wrap: anywhere;
+}
+
+/* 关键词那一路拆出来的检索词。它决定这一路能不能命中，所以摆出来让人一眼能验 */
+.terms {
+  margin-top: 12px;
+  color: #5b6472;
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+.ranks {
+  flex: none;
+  display: inline-flex;
+  gap: 5px;
+}
+.ranks span {
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: #eef0f4;
+  color: #6b7381;
+  font-size: 11px;
+  white-space: nowrap;
 }
 
 .docs {

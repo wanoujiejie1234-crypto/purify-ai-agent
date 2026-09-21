@@ -1,7 +1,10 @@
 package com.purify.purifyaiagent.chat;
 
+import java.util.Arrays;
+import java.util.EnumMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 /**
  * 对话的入口——用户是从哪个页面进来的。存进 {@code chat_session.entry}。
@@ -23,6 +26,20 @@ public enum ChatEntry {
     /** PurifyManus 智能体。 */
     MANUS("manus", List.of(ChatScene.MANUS));
 
+    /**
+     * scene → entry 的反查表，类加载时由上面那两行声明建好。
+     *
+     * <p>存在的理由是「加一个 scene 忘了登记」这件事<b>不会有任何报错</b>：
+     * 漏登记的 scene 不会出现在任何入口的 {@link #scenes()} 里，
+     * {@code findByConversation} 的 {@code IN (...)} 因此少一个值，
+     * 表现是「用户先发的图，翻历史时不见了」——没有异常、没有日志、也没有测试变红。
+     *
+     * <p>建表时顺手把两种登记错误炸出来（重复登记、以及 {@link #of} 查不到），
+     * 和 {@code AgentToolRegistry#assertNoDuplicateNames} 是同一个取向：
+     * 装配期的错误就该在装配期响，而不是等某个用户翻历史时才发现少了一截。
+     */
+    private static final Map<ChatScene, ChatEntry> BY_SCENE = buildByScene();
+
     /** 前端路由 / URL 里用的名字，与 {@code chatConfig.js} 里的 link 字段一字不差。 */
     private final String link;
 
@@ -43,6 +60,31 @@ public enum ChatEntry {
     }
 
     /**
+     * 这个 scene 属于哪个入口；没有登记时返回 {@code null}。
+     *
+     * <p>返回 null 而不是抛异常，是为了让调用方能自己决定怎么办——
+     * 生产代码里 {@link #scenes()} 才是入口，这个方法主要是给守卫测试用的
+     * （见 {@code ChatEntryTest}）：它遍历 {@code ChatScene.values()} 一个个问过来，
+     * 谁没登记就报谁，加一个 scene 忘了登记会直接测试失败。
+     */
+    public static ChatEntry of(ChatScene scene) {
+        return BY_SCENE.get(scene);
+    }
+
+    /**
+     * 所有入口的 link，按声明顺序。
+     *
+     * <p>给「只支持 a、b、c」这类报错文案用。原先调用方是手写
+     * {@code ChatEntry.SLIM.link(), ChatEntry.MANUS.link()} 两个参数，
+     * 而资源包里的文案也跟着写死了 {@code {1}} 和 {@code {2}} 两个槽位——
+     * 加第三个入口时，报错信息会理直气壮地漏掉它，既不报错也没人会发现。
+     * 现在槽位只有一个，装的是这里拼出来的完整清单。
+     */
+    public static List<String> links() {
+        return Arrays.stream(values()).map(ChatEntry::link).toList();
+    }
+
+    /**
      * 按链接名解析，大小写不敏感。
      *
      * <p>解析不了时返回 {@code null} 而不是抛异常：调用方需要区分「没传」和「传错了」——
@@ -60,5 +102,28 @@ public enum ChatEntry {
             }
         }
         return null;
+    }
+
+    /**
+     * 把「入口 → 场景」翻过来建成「场景 → 入口」。
+     *
+     * <p>一个 scene 出现在两个入口下时会抛异常而不是让后来的覆盖先前的：
+     * 那意味着同一个会话会同时出现在侧边栏的两栏里，而「哪一栏才是对的」没有答案。
+     * 这属于写错了代码，不是运行时状况，所以直接炸——和 {@code ChatEntry} 上面那条
+     * 「漏登记不会有任何报错」是同一件事的两面：能炸的就不留给运行期去悄悄错。
+     */
+    private static Map<ChatScene, ChatEntry> buildByScene() {
+        Map<ChatScene, ChatEntry> byScene = new EnumMap<>(ChatScene.class);
+        for (ChatEntry entry : values()) {
+            for (ChatScene scene : entry.scenes) {
+                ChatEntry previous = byScene.put(scene, entry);
+                if (previous != null) {
+                    throw new IllegalStateException("场景 " + scene + " 在入口映射里出现了两次（"
+                            + previous + " 和 " + entry + "）。一个场景只能属于一个入口，"
+                            + "否则同一个会话会在侧边栏的两栏里各出现一次");
+                }
+            }
+        }
+        return Map.copyOf(byScene);
     }
 }

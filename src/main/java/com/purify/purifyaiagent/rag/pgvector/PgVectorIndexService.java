@@ -8,6 +8,7 @@ import com.purify.purifyaiagent.model.DocumentIndexResult;
 import com.purify.purifyaiagent.model.KnowledgeBaseStats;
 import com.purify.purifyaiagent.model.KnowledgeDocumentItem;
 import com.purify.purifyaiagent.model.KnowledgeDocumentPage;
+import com.purify.purifyaiagent.model.SyncedSource;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.document.DocumentReader;
@@ -22,11 +23,15 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.util.StringUtils;
 
 import java.time.Instant;
+import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.function.Function;
 
 /**
  * 本地向量库的索引服务 —— 流程图左半边「建立索引」那一段。
@@ -67,9 +72,6 @@ public class PgVectorIndexService {
     /** 元数据键：入库时刻。 */
     public static final String META_UPLOADED_AT = "uploaded_at";
 
-    /** 支持的文档后缀。文本没有可靠的魔数，只能按后缀判定。 */
-    private static final Set<String> SUPPORTED_EXTENSIONS = Set.of("txt", "md", "markdown");
-
     /**
      * 替换字符（U+FFFD）占比超过这个比例就认为编码不对。
      *
@@ -77,9 +79,6 @@ public class PgVectorIndexService {
      * 替换字符——不拦的话会把一锅乱码老老实实索引进去，检索时还查不出来问题在哪。
      */
     private static final double REPLACEMENT_CHAR_RATIO_LIMIT = 0.01;
-
-    /** 表名/模式名的合法字符，与 {@code PgVectorSchemaValidator} 用的是同一套规则。 */
-    private static final String SAFE_IDENTIFIER = "^[a-zA-Z0-9_]{1,64}$";
 
     /** 预览最多列出几片。整份列出来在管理页上没法看，而「切成多少片」那个数仍然是真的。 */
     private static final int PREVIEW_LIMIT = 20;
@@ -113,9 +112,10 @@ public class PgVectorIndexService {
         this.ragProperties = ragProperties;
 
         // 表名要拼进 SQL，这里挡一道：配置写错了应当即刻失败，
-        // 而不是等到某次查询报语法错误
-        assertSafeIdentifier(pgVectorProperties.getSchemaName(), "purify.rag.pgvector.schema-name");
-        assertSafeIdentifier(pgVectorProperties.getTableName(), "purify.rag.pgvector.table-name");
+        // 而不是等到某次查询报语法错误。防线本身在 PgVectorSql 里，
+        // 关键词检索那一路用的是同一份
+        PgVectorSql.assertSafeIdentifier(pgVectorProperties.getSchemaName(), "purify.rag.pgvector.schema-name");
+        PgVectorSql.assertSafeIdentifier(pgVectorProperties.getTableName(), "purify.rag.pgvector.table-name");
 
         PgVectorProperties.Chunk chunk = pgVectorProperties.getChunk();
         this.splitter = TokenTextSplitter.builder()
@@ -139,19 +139,96 @@ public class PgVectorIndexService {
         String category = requireKnownClassification(classification);
 
         // 1. 文档预处理 + 2. 切片（校验都在切片完成之前做，这样校验不通过时旧数据原封不动）
-        List<Document> chunks = split(read(resource, source, category), source);
+        return write(source, category, split(read(resource, source, category), source));
+    }
 
-        // 3. 向量转换与存储。先删后写，保证同一来源只有一份。
-        //    过滤表达式用 Filter.Expression 而不是拼字符串：字符串版本要自己写 jsonpath 语法，
-        //    拼错是运行时才失败，而且删 0 行也不报错
+    /**
+     * 把一批<b>已经切好的</b>切片写进本地向量库。
+     *
+     * <p><b>存在的唯一理由</b>：百炼那边的切片比本地 {@code TokenTextSplitter} 好，
+     * 而这个效果全在「怎么切」上。所以这条路上<b>绝不能再切一次</b>——再切一次就等于
+     * 把百炼的切片换成本地的，这个功能的意义当场归零。因此这里跳过
+     * {@link #read} 和 {@link #split}，只补元数据再落库。
+     *
+     * <p><b>分工与 {@link #read} 一致：调用方给什么就用什么，给不了的本地兜底。</b>
+     * 百炼侧能提供的（{@code title}、以及调用方自己填的同步标记）由调用方预先写进
+     * 各片的元数据，本方法只负责补齐其余几项——所以 {@code title} 用的是
+     * {@code putIfAbsent} 而不是 {@code put}。
+     *
+     * <p>逐条校验都是照着 {@code read()} + {@code split()} 抄的，一处没漏：漏掉任何一条，
+     * 这条路就成了绕过校验的后门，而两条路产出的切片在检索时无从区分。
+     *
+     * @param source         幂等锚点，用百炼侧的文件名（Name），与上传路径的
+     *                       {@code originalFilename} 同域——这样「上传 A.md」和
+     *                       「同步 A.md」在文档列表里是同一行
+     * @param classification 整份文档统一的分类。一份文档内的多分类已由调用方塌缩
+     * @param chunks         百炼切好的切片，顺序即 {@code chunk_index}
+     */
+    public DocumentIndexResult indexPreChunked(String source, String classification, List<Document> chunks) {
+        String normalizedSource = requireFilename(source);
+        String category = requireKnownClassification(classification);
+
+        if (chunks == null || chunks.isEmpty()) {
+            throw ApiException.documentIndexFailed("error.kb.chunksEmpty", normalizedSource);
+        }
+        if (chunks.stream().allMatch(chunk -> !StringUtils.hasText(chunk.getText()))) {
+            throw ApiException.documentIndexFailed("error.kb.contentEmpty", normalizedSource);
+        }
+
+        // 上限判定刻意用 > 而不是 split() 里的 >= ：那边的 >= 是因为 TokenTextSplitter
+        // 到上限就静默丢弃、撞上等于内容被截断；而这里一份诚实切出 2000 片的文档是完整的，
+        // 只在真正超过时才拒绝。也正因为语义不同，不能复用 error.kb.chunkLimitReached——
+        // 那条文案写着「超出的内容会被丢弃」，在这里是句假话
+        int maxNumChunks = pgVectorProperties.getChunk().getMaxNumChunks();
+        if (chunks.size() > maxNumChunks) {
+            throw ApiException.documentIndexFailed(
+                    "error.kb.bailianChunkLimitExceeded", maxNumChunks, normalizedSource);
+        }
+
+        String fallbackTitle = stripExtension(normalizedSource);
+        String uploadedAt = Instant.now().toString();
+        String filterKey = ragProperties.getRouter().getFilterKey();
+
+        for (int i = 0; i < chunks.size(); i++) {
+            // 覆盖而不是 putIfAbsent，理由同 read()：Reader 自带的 source 会和幂等锚点同名不同值，
+            // 不覆盖的表现是「删 0 行、不报错、每次同步都多一份切片」
+            Map<String, Object> metadata = chunks.get(i).getMetadata();
+            metadata.put(META_SOURCE, normalizedSource);
+            metadata.put(META_DOC_NAME, normalizedSource);
+            metadata.putIfAbsent(META_TITLE, fallbackTitle);
+            metadata.put(filterKey, category);
+            metadata.put(META_UPLOADED_AT, uploadedAt);
+            metadata.put(META_CHUNK_INDEX, i);
+        }
+
+        // 百炼侧那份文件本身是 GBK 时，乱码会经由 HTTP 原样传下来。这里同样是唯一能拦住它的地方
+        verifyEncoding(chunks, normalizedSource);
+        return write(normalizedSource, category, chunks);
+    }
+
+    /**
+     * 落库那一段：<b>先按来源删干净、再写新的、最后反查自检</b>。
+     *
+     * <p><b>两条路（本地切片 / 百炼切片）共用这一份实现，不能各写各的。</b>
+     * 这十几行是幂等性的全部实现——删除用的过滤表达式和写入前写进元数据的 {@code source}
+     * 必须逐字一致。两份实现一旦漂移，表现是「每次同步多一份切片、检索召回重复内容」，
+     * 而日志里只有一条 warn。抽在这里之后，「同一份文档永远只有一份」这个保证
+     * 只由一个地方提供。
+     *
+     * <p>代价与上传路径完全相同：这两步不在一个事务里（{@code PgVectorStore} 内部没有事务），
+     * 中途失败会让该来源的数据暂时为空，重新来一次即可。
+     */
+    private DocumentIndexResult write(String source, String category, List<Document> chunks) {
+        // 过滤表达式用 Filter.Expression 而不是拼字符串：字符串版本要自己写 jsonpath 语法，
+        // 拼错是运行时才失败，而且删 0 行也不报错
         vectorStore.delete(new FilterExpressionBuilder().eq(META_SOURCE, source).build());
         vectorStore.add(chunks);
 
         long characterCount = chunks.stream().mapToLong(chunk -> chunk.getText().length()).sum();
         log.info("[pgvector索引] {} 已入库：分类={} 切片={} 字符={}", source, category, chunks.size(), characterCount);
 
-        // 4. 自检。delete 不返回影响行数，只能反查——如果删除表达式和写入的 source 对不上，
-        //    表现就是「重传后出现两份」，这里至少能让它在日志里现形
+        // 自检。delete 不返回影响行数，只能反查——如果删除表达式和写入的 source 对不上，
+        // 表现就是「重传后出现两份」，这里至少能让它在日志里现形
         long actual = countBySource(source);
         if (actual != chunks.size()) {
             log.warn("[pgvector索引] {} 期望 {} 片、实际查到 {} 片，可能存在残留切片",
@@ -214,7 +291,7 @@ public class PgVectorIndexService {
         String table = qualifiedTableName();
         int safeSize = Math.clamp(size, 1, MAX_PAGE_SIZE);
         int safePage = Math.max(page, 1);
-        String classificationKey = safeMetadataKey(
+        String classificationKey = PgVectorSql.safeMetadataKey(
                 ragProperties.getRouter().getFilterKey(), "purify.rag.router.filter-key");
 
         Long total = pgJdbcTemplate.queryForObject(
@@ -262,6 +339,61 @@ public class PgVectorIndexService {
         return new KnowledgeBaseStats(total == null ? 0 : total, bySource.size(), bySource, byClassification);
     }
 
+    /**
+     * 批量查「这几个来源在本地有没有、多少片、什么时候进来的、带着哪些同步标记」。
+     *
+     * <p>给知识库同步用：一页最多列一百份百炼文档，逐份去查就是一百次数据库往返，
+     * 所以拼一条带 IN 的 SQL 一次拿完。
+     *
+     * <p><b>两个标记键由调用方传入，而不是在本类里写死</b>：它们是「哪一方、在什么时间
+     * 把这份文档推进来的」这类<b>来源侧</b>的记账信息，写进去的那一方才知道它们叫什么。
+     * 本类只管按名字读回来——和 {@link #groupCount} 按配置的 filter-key 分组是同一个做法。
+     *
+     * @param sources        要查的来源标识，通常是文件名
+     * @param fileIdKey      存「来源侧文件标识」的元数据键；本地手动上传的文档没有这个键
+     * @param gmtModifiedKey 存「来源侧文件修改时间」的元数据键，值是原始长整型
+     * @return 来源 → 摘要。查不到的来源<b>不会</b>出现在返回的 Map 里，而不是映射成一份空摘要——
+     *         调用方要靠这个区别来分辨「本地压根没有」和「本地有但是空的」，后者不是一回事
+     */
+    public Map<String, SyncedSource> summariesBySources(List<String> sources,
+                                                        String fileIdKey,
+                                                        String gmtModifiedKey) {
+        if (sources == null || sources.isEmpty()) {
+            return Map.of();
+        }
+
+        String table = qualifiedTableName();
+        String fileKey = PgVectorSql.safeMetadataKey(fileIdKey, "同步标记元数据键（文件标识）");
+        String modifiedKey = PgVectorSql.safeMetadataKey(gmtModifiedKey, "同步标记元数据键（修改时间）");
+
+        // 占位符按个数拼，值一律走参数。listDocuments 已经立了参数化的规矩，
+        // 这里不因为「值是自家的文件名」就开一个拼字符串的口子
+        String placeholders = String.join(", ", Collections.nCopies(sources.size(), "?"));
+        String sql = "SELECT metadata->>'" + META_SOURCE + "' AS source, "
+                + "count(*) AS chunks, "
+                + "COALESCE(max(metadata->>'" + META_UPLOADED_AT + "'), '') AS uploaded_at, "
+                + "max(metadata->>'" + fileKey + "') AS file_id, "
+                + "max(metadata->>'" + modifiedKey + "') AS gmt_modified "
+                + "FROM " + table + " "
+                + "WHERE metadata->>'" + META_SOURCE + "' IN (" + placeholders + ") "
+                + "GROUP BY 1";
+
+        // 用 RowMapper 而不是 RowCallbackHandler：后者那个重载和 RowMapper 的
+        // query(String, ..., Object...) 在块状 lambda 下会被 javac 判成歧义
+        List<SyncedSource> rows = pgJdbcTemplate.query(sql, (resultSet, rowNum) -> new SyncedSource(
+                resultSet.getString("source"),
+                resultSet.getLong("chunks"),
+                resultSet.getString("uploaded_at"),
+                resultSet.getString("file_id"),
+                parseLong(resultSet.getString("gmt_modified"))), sources.toArray());
+
+        Map<String, SyncedSource> summaries = new LinkedHashMap<>();
+        for (SyncedSource row : rows) {
+            summaries.put(row.source(), row);
+        }
+        return summaries;
+    }
+
     // ==================== 内部实现 ====================
 
     /**
@@ -277,23 +409,14 @@ public class PgVectorIndexService {
         String extension = StringUtils.getFilenameExtension(source);
         String normalizedExtension = extension == null ? "" : extension.toLowerCase(Locale.ROOT);
 
-        DocumentReader reader = switch (normalizedExtension) {
-            case "txt" -> new TextReader(resource);
-            case "md", "markdown" -> new MarkdownDocumentReader(resource, MarkdownDocumentReaderConfig.builder()
-                    .withHorizontalRuleCreateDocument(false)
-                    // 代码块对健康知识库是噪声，索引进去只会稀释召回
-                    .withIncludeCodeBlock(false)
-                    .withIncludeBlockquote(true)
-                    .build());
-            default -> throw ApiException.unsupportedDocument(
-                    "只支持 " + SUPPORTED_EXTENSIONS + " 这几种文本格式，当前文件是「" + source + "」，"
-                            + "识别出的后缀是「" + normalizedExtension + "」。"
-                            + "PDF / Word 需要先转成文本再上传。");
-        };
+        DocumentReader reader = DocFormat.of(normalizedExtension)
+                .orElseThrow(() -> ApiException.unsupportedDocument(
+                        "error.kb.extensionUnsupported", DocFormat.extensions(), source, normalizedExtension))
+                .reader(resource);
 
         List<Document> documents = reader.get();
         if (documents.isEmpty() || documents.stream().allMatch(document -> !StringUtils.hasText(document.getText()))) {
-            throw ApiException.documentIndexFailed("文档内容为空，没什么可索引的：" + source);
+            throw ApiException.documentIndexFailed("error.kb.contentEmpty", source);
         }
 
         String docName = source;
@@ -319,21 +442,87 @@ public class PgVectorIndexService {
         return documents;
     }
 
+    /**
+     * 支持的文档格式，以及「这个后缀该用哪个 Reader 解析」。
+     *
+     * <p><b>为什么把这两件事放在一起</b>：它们本来是同一件事的两半——「支持哪些格式」是
+     * 说给用户听的，{@code read()} 里的分派是做给程序看的，但两者必须是同一份清单。
+     * 拆成「一个 {@code SUPPORTED_EXTENSIONS} 常量 + 一个 switch」时，加一种格式要改两处，
+     * 而且没有任何机制保证两处同步：switch 的 {@code default} 会吃掉编译期检查，
+     * 白名单又会被拼进报错文案。于是漂移的表现是<b>自相矛盾的提示</b>——
+     * 弹窗里写着「只支持 [txt, md, markdown]」，而你传的正是一个 md，它却被 default 拦下了。
+     *
+     * <p>合成枚举之后，加一种格式 = 加一个常量，白名单和分派一起生效，
+     * 报错文案也自动跟着对。
+     *
+     * <p><b>只按后缀判定，不看 Content-Type</b>，理由见 {@link #read}。
+     */
+    private enum DocFormat {
+
+        TXT("txt", TextReader::new),
+
+        MD("md", DocFormat::markdownReader),
+
+        MARKDOWN("markdown", DocFormat::markdownReader);
+
+        private final String extension;
+
+        private final Function<Resource, DocumentReader> readerFactory;
+
+        DocFormat(String extension, Function<Resource, DocumentReader> readerFactory) {
+            this.extension = extension;
+            this.readerFactory = readerFactory;
+        }
+
+        DocumentReader reader(Resource resource) {
+            return readerFactory.apply(resource);
+        }
+
+        /**
+         * 支持的后缀清单，按声明顺序——它会原样出现在「只支持 {0} 这几种文本格式」那条
+         * 报错里，顺序固定下来，用户对比自己的文件时不用在两个顺序之间来回找。
+         */
+        static Set<String> extensions() {
+            Set<String> extensions = new LinkedHashSet<>();
+            for (DocFormat format : values()) {
+                extensions.add(format.extension);
+            }
+            return extensions;
+        }
+
+        /** 后缀对应的格式，已转小写；认不出来时返回空，由调用方决定报什么错。 */
+        static Optional<DocFormat> of(String extension) {
+            for (DocFormat format : values()) {
+                if (format.extension.equals(extension)) {
+                    return Optional.of(format);
+                }
+            }
+            return Optional.empty();
+        }
+
+        private static DocumentReader markdownReader(Resource resource) {
+            return new MarkdownDocumentReader(resource, MarkdownDocumentReaderConfig.builder()
+                    .withHorizontalRuleCreateDocument(false)
+                    // 代码块对健康知识库是噪声，索引进去只会稀释召回
+                    .withIncludeCodeBlock(false)
+                    .withIncludeBlockquote(true)
+                    .build());
+        }
+    }
+
     /** 切片，并给每片打上序号。 */
     private List<Document> split(List<Document> documents, String source) {
         List<Document> chunks = splitter.apply(documents);
 
         if (chunks.isEmpty()) {
-            throw ApiException.documentIndexFailed("切片结果为空，文档可能只有空白字符：" + source);
+            throw ApiException.documentIndexFailed("error.kb.chunksEmpty", source);
         }
 
         // TokenTextSplitter 到 maxNumChunks 就不再加了，超出的内容被静默丢弃。
         // 撞上上限就当作失败处理，而不是索引一份「只有前一半」的文档
         int maxNumChunks = pgVectorProperties.getChunk().getMaxNumChunks();
         if (chunks.size() >= maxNumChunks) {
-            throw ApiException.documentIndexFailed(
-                    "切片数达到上限 " + maxNumChunks + "，超出的内容会被丢弃。请把文档拆小后分几次上传，"
-                            + "或调大 purify.rag.pgvector.chunk.max-num-chunks：" + source);
+            throw ApiException.documentIndexFailed("error.kb.chunkLimitReached", maxNumChunks, source);
         }
 
         for (int i = 0; i < chunks.size(); i++) {
@@ -352,9 +541,7 @@ public class PgVectorIndexService {
             replaced += text.chars().filter(character -> character == '�').count();
         }
         if (total > 0 && (double) replaced / total > REPLACEMENT_CHAR_RATIO_LIMIT) {
-            throw ApiException.documentIndexFailed(
-                    "文档内容不是有效的 UTF-8（" + replaced + "/" + total + " 个字符无法解码）：" + source
-                            + "。请另存为 UTF-8 编码后重新上传。");
+            throw ApiException.documentIndexFailed("error.kb.notUtf8", replaced, total, source);
         }
     }
 
@@ -366,7 +553,7 @@ public class PgVectorIndexService {
      */
     private String requireKnownClassification(String classification) {
         if (!StringUtils.hasText(classification)) {
-            throw ApiException.unsupportedDocument("必须指定 classification（归档到哪一类）");
+            throw ApiException.unsupportedDocument("error.kb.classificationRequired");
         }
         String category = classification.trim();
 
@@ -376,15 +563,14 @@ public class PgVectorIndexService {
                 .toList();
         // 分类表没配时不拦：配置缺失不该让上传功能整个不可用
         if (!known.isEmpty() && !known.contains(category)) {
-            throw ApiException.unsupportedDocument(
-                    "未知的分类「" + category + "」，可选值来自 purify.rag.router.categories：" + known);
+            throw ApiException.unsupportedDocument("error.kb.classificationUnknown", category, known);
         }
         return category;
     }
 
     private static String requireFilename(String filename) {
         if (!StringUtils.hasText(filename)) {
-            throw ApiException.unsupportedDocument("文件名不能为空：它同时用作切片来源标识，删改都靠它");
+            throw ApiException.unsupportedDocument("error.kb.filenameRequired");
         }
         return filename.trim();
     }
@@ -395,7 +581,7 @@ public class PgVectorIndexService {
     }
 
     private String qualifiedTableName() {
-        return pgVectorProperties.getSchemaName() + "." + pgVectorProperties.getTableName();
+        return PgVectorSql.qualifiedTableName(pgVectorProperties);
     }
 
     private long countBySource(String source) {
@@ -412,7 +598,7 @@ public class PgVectorIndexService {
      * 这里只需要「按值分组」，普通取值语法更简单也更快。
      */
     private Map<String, Long> groupCount(String table, String metadataKey) {
-        String key = safeMetadataKey(metadataKey, "purify.rag.router.filter-key");
+        String key = PgVectorSql.safeMetadataKey(metadataKey, "purify.rag.router.filter-key");
         String sql = "SELECT COALESCE(metadata->>'" + key + "', '" + UNLABELED + "') AS key, count(*) AS total "
                 + "FROM " + table + " GROUP BY 1 ORDER BY 2 DESC";
 
@@ -423,30 +609,28 @@ public class PgVectorIndexService {
         return counts;
     }
 
-    private static void assertSafeIdentifier(String identifier, String propertyName) {
-        if (identifier == null || !identifier.matches(SAFE_IDENTIFIER)) {
-            throw new IllegalStateException(
-                    propertyName + " 只能是字母、数字、下划线，且不超过 64 个字符，当前是：" + identifier);
-        }
-    }
-
-    /**
-     * 元数据字段名要拼进 SQL，和表名一样先挡一道。
-     *
-     * <p>取值来自配置（{@code router.filter-key}），是开发者自己写的、不是外部输入，
-     * 所以这不是一个真实的注入面。但拼 SQL 的地方各自裸拼字符串迟早会出事——
-     * 表名那边已经立了「配置写错应当即刻失败」的规矩，这里沿用同一条。
-     * 顺带还有个好处：字段名写错（比如多加了个引号）会在第一次查询时就报出来，
-     * 而不是变成一句语法错误让人猜是哪里拼坏的。
-     */
-    private static String safeMetadataKey(String metadataKey, String propertyName) {
-        assertSafeIdentifier(metadataKey, propertyName);
-        return metadataKey;
-    }
-
     /** 从元数据里取一个整数。类型对不上时退回 0，不让它把一次预览变成异常。 */
     private static int intOf(Object value) {
         return value instanceof Number number ? number.intValue() : 0;
+    }
+
+    /**
+     * 把元数据里取回来的长整型文本解析成数字；解析不了退回 {@code null}。
+     *
+     * <p>元数据过一道 JSON 序列化，数字取回来是文本，且不保证合法（可能是人手写进库的，
+     * 也可能是更早的版本写的别的格式）。一个存坏的标记不该让整页清单打不开——
+     * 退成 null 的表现是那一行显示「未同步」，而不是整个接口 500。
+     */
+    private static Long parseLong(String text) {
+        if (!StringUtils.hasText(text)) {
+            return null;
+        }
+        try {
+            return Long.valueOf(text.trim());
+        }
+        catch (NumberFormatException exception) {
+            return null;
+        }
     }
 
     private static String abbreviate(String text) {

@@ -4,8 +4,12 @@ import com.purify.purifyaiagent.auth.RequireAdmin;
 import com.purify.purifyaiagent.exception.ApiException;
 import com.purify.purifyaiagent.model.RagSearchResult;
 import com.purify.purifyaiagent.rag.KnowledgeSearch;
+import com.purify.purifyaiagent.rag.pgvector.KeywordArmStatus;
+import com.purify.purifyaiagent.rag.pgvector.PgKeywordSearcher;
+import com.purify.purifyaiagent.rag.pgvector.RrfFusion;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.document.Document;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -45,8 +49,22 @@ public class RagController {
 
     private final KnowledgeSearch knowledgeSearch;
 
-    public RagController(KnowledgeSearch knowledgeSearch) {
+    /**
+     * 关键词那一路的状态与拆词器。
+     *
+     * <p>用 {@code ObjectProvider} 取：走百炼链路时这两个 Bean 都不存在
+     * （它们只在 {@code store=pgvector} 时装配），那时 {@code keyword} 字段回 null。
+     */
+    private final ObjectProvider<KeywordArmStatus> keywordArmStatus;
+
+    private final ObjectProvider<PgKeywordSearcher> keywordSearcher;
+
+    public RagController(KnowledgeSearch knowledgeSearch,
+                         ObjectProvider<KeywordArmStatus> keywordArmStatus,
+                         ObjectProvider<PgKeywordSearcher> keywordSearcher) {
         this.knowledgeSearch = knowledgeSearch;
+        this.keywordArmStatus = keywordArmStatus;
+        this.keywordSearcher = keywordSearcher;
     }
 
     /**
@@ -68,7 +86,7 @@ public class RagController {
     @GetMapping("/search")
     public RagSearchResult search(@RequestParam("q") String question) {
         if (!StringUtils.hasText(question)) {
-            throw ApiException.invalidChatRequest("q（要检索的问题）不能为空");
+            throw ApiException.invalidChatRequest("error.rag.queryRequired");
         }
 
         KnowledgeSearch.Result result = knowledgeSearch.search(question);
@@ -86,7 +104,29 @@ public class RagController {
                 result.elapsedMs(),
                 toChunks(documents),
                 // 没召回时给 null 而不是空串：调用方一眼能看出「没有东西会被拼进 Prompt」
-                documents.isEmpty() ? null : result.renderAgentReference());
+                documents.isEmpty() ? null : result.renderAgentReference(),
+                keywordArm(question));
+    }
+
+    /**
+     * 关键词那一路的状态 + 本次拆出的检索词。
+     *
+     * <p><b>这一段是整个混合检索方案里唯一「可能悄悄做错又看不出来」的地方的照妖镜。</b>
+     * 拆词规则是启发式的、关键词库要不要装扩展是外部条件——两件事都不会报错，
+     * 只会让召回悄悄变差。把它们摆在这个自检接口上，就不必去翻日志猜。
+     */
+    private RagSearchResult.KeywordArm keywordArm(String question) {
+        KeywordArmStatus status = keywordArmStatus.getIfAvailable();
+        if (status == null) {
+            // 走百炼链路：本地没有这一路可言
+            return null;
+        }
+        PgKeywordSearcher searcher = keywordSearcher.getIfAvailable();
+        return new RagSearchResult.KeywordArm(
+                status.enabled(),
+                status.available(),
+                status.reason(),
+                searcher == null ? List.of() : searcher.termsOf(question));
     }
 
     private static List<RagSearchResult.Chunk> toChunks(List<Document> documents) {
@@ -98,7 +138,13 @@ public class RagController {
                         excerpt(document.getText()),
                         // 百炼那条链路没有重排分数这件东西（重排在云端做，本地拿不到），
                         // 所以这里允许为 null，而不是硬塞一个 0——0 分和「没有分数」是两回事
-                        doubleOf(document.getMetadata().get("rerank_score"))))
+                        doubleOf(document.getMetadata().get("rerank_score")),
+                        // 下面四个同理：没走融合时它们是 null，而不是 0。
+                        // 「没被某一召回路命中」和「在那一路上排第 0 名」是两回事
+                        doubleOf(document.getMetadata().get(RrfFusion.META_SCORE)),
+                        textOf(document.getMetadata().get(RrfFusion.META_ARMS)),
+                        intOrNull(document.getMetadata().get(RrfFusion.META_RANK_PREFIX + "vector")),
+                        intOrNull(document.getMetadata().get(RrfFusion.META_RANK_PREFIX + "keyword"))))
                 .toList();
     }
 
@@ -119,5 +165,15 @@ public class RagController {
 
     private static Double doubleOf(Object value) {
         return value instanceof Number number ? number.doubleValue() : null;
+    }
+
+    /**
+     * 取一个整数，取不到返回 {@code null}。
+     *
+     * <p>和 {@link #intOf} 的区别是「取不到时不编一个 0 出来」——这里记的是「在某一路上
+     * 排第几」，而「没被那一路召回」和「排第 0 名」是两回事，压成 0 就再也分不开了。
+     */
+    private static Integer intOrNull(Object value) {
+        return value instanceof Number number ? number.intValue() : null;
     }
 }

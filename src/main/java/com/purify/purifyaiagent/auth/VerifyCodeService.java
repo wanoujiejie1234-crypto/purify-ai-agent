@@ -129,7 +129,7 @@ public class VerifyCodeService {
     private static String requireEmail(String email) {
         String normalized = UserRepository.normalizeEmail(email);
         if (!StringUtils.hasText(normalized)) {
-            throw ApiException.authInvalid("邮箱不能为空");
+            throw ApiException.authInvalid("error.auth.emailRequired");
         }
         return normalized;
     }
@@ -153,27 +153,27 @@ public class VerifyCodeService {
     public long verify(String email, VerificationPurpose purpose, String submittedCode) {
         String normalized = UserRepository.normalizeEmail(email);
         if (!StringUtils.hasText(submittedCode)) {
-            throw ApiException.authInvalid("请填写验证码");
+            throw ApiException.authInvalid("error.auth.codeRequired");
         }
 
         Optional<VerifyCodeRepository.StoredCode> found = repository.findLatest(normalized, purpose);
         if (found.isEmpty()) {
-            throw ApiException.authInvalid("请先获取验证码");
+            throw ApiException.authInvalid("error.auth.codeNotSent");
         }
         VerifyCodeRepository.StoredCode stored = found.get();
 
         // 顺序有讲究：先判「用过」再判「过期」。反过来的话，一条用过且过期的码
         // 会报「已过期」，用户去重新获取——而正确的结果（已经用过了）其实已经达成
         if (stored.used()) {
-            throw ApiException.authInvalid("这个验证码已经用过了，请重新获取");
+            throw ApiException.authInvalid("error.auth.codeUsed");
         }
         if (stored.isExpired()) {
-            throw ApiException.authInvalid("验证码已过期，请重新获取");
+            throw ApiException.authInvalid("error.auth.codeExpired");
         }
 
         int maxAttempts = authProperties.getCode().getMaxAttempts();
         if (stored.attempts() >= maxAttempts) {
-            throw ApiException.authInvalid("验证码错误次数过多，已失效，请重新获取");
+            throw ApiException.authInvalid("error.auth.codeTooManyAttempts");
         }
 
         // 先记一次尝试再比对：反过来的话，一个错误的验证码不会留下任何痕迹，
@@ -181,9 +181,7 @@ public class VerifyCodeService {
         int attempts = repository.incrementAttempts(stored.id());
         if (!matches(stored.code(), submittedCode)) {
             int left = maxAttempts - attempts;
-            throw ApiException.authInvalid(left > 0
-                    ? "验证码不正确，还可以试 " + left + " 次"
-                    : "验证码错误次数过多，已失效，请重新获取");
+            throw ApiException.authInvalid(left > 0 ? "error.auth.codeWrong" : "error.auth.codeTooManyAttempts", left);
         }
 
         return stored.id();
@@ -231,7 +229,7 @@ public class VerifyCodeService {
     private void enforceResendCooldown(String email, VerificationPurpose purpose) {
         long remaining = remainingCooldownSeconds(email, purpose);
         if (remaining > 0) {
-            throw ApiException.codeTooFrequent("请求太频繁了，请 " + remaining + " 秒后再试");
+            throw ApiException.codeTooFrequent("error.auth.codeTooFrequent", remaining);
         }
     }
 

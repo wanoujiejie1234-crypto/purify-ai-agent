@@ -17,6 +17,7 @@
  */
 
 import * as auth from '../auth.js'
+import { t, acceptLanguageHeader } from '../i18n/index.js'
 
 /**
  * 发起一次流式请求。
@@ -45,6 +46,9 @@ export async function streamChat({ url, chatId, message, signal, onEvent, onChat
   if (currentToken) {
     headers.Authorization = `Bearer ${currentToken}`
   }
+  // 和 http.js 那边一样要带语言。这条链路绕过了 axios 的拦截器，
+  // 所以两处都要各写一次——漏掉这一处，对话页上的报错会永远是中文
+  headers['Accept-Language'] = acceptLanguageHeader()
 
   const resp = await fetch(url, {
     method: 'POST',
@@ -72,7 +76,7 @@ export async function streamChat({ url, chatId, message, signal, onEvent, onChat
     throw new Error(await readErrorMessage(resp))
   }
   if (!resp.body) {
-    throw new Error('当前浏览器不支持流式读取（response.body 为空）。')
+    throw new Error(t('error.streamUnsupported'))
   }
 
   const reader = resp.body.getReader()
@@ -166,9 +170,9 @@ async function readErrorMessage(resp) {
   try {
     const body = await resp.json()
     if (body?.message) return body.message
-    if (body?.code) return `请求失败（${body.code}）`
+    if (body?.code) return t('error.code', { code: body.code })
   } catch {
     // 响应体不是 JSON，走下面的兜底
   }
-  return `请求失败（HTTP ${resp.status}）`
+  return t('error.http', { status: resp.status })
 }

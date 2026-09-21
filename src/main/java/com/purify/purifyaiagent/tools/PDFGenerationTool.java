@@ -4,6 +4,8 @@ import com.aliyun.oss.OSS;
 import com.aliyun.oss.OSSClientBuilder;
 import com.aliyun.oss.model.ObjectMetadata;
 import com.purify.purifyaiagent.config.AliyunOssProperties;
+import com.purify.purifyaiagent.resource.ResourceKind;
+import com.purify.purifyaiagent.resource.ResourceRecorder;
 import com.itextpdf.kernel.font.PdfFont;
 import com.itextpdf.kernel.font.PdfFontFactory;
 import com.itextpdf.kernel.pdf.PdfDocument;
@@ -12,12 +14,15 @@ import com.itextpdf.layout.Document;
 import com.itextpdf.layout.element.Paragraph;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.ai.chat.model.ToolContext;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.util.StringUtils;
+import org.springframework.web.util.UriUtils;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 
 /**
@@ -39,14 +44,18 @@ public class PDFGenerationTool {
 
     private final AliyunOssProperties properties;
 
+    /** 产出之后往资料库记一笔。见 {@code ResourceRecorder}——它不抛异常，不会拖累本工具。 */
+    private final ResourceRecorder resourceRecorder;
+
     /** 只存「去掉协议头」的域名，拼下载链接和建客户端都用它，避免两处各解析一遍。 */
     private final String endpointHost;
 
     /** 懒创建的客户端。用 volatile + 双重检查：工具有可能被并发调用。 */
     private volatile OSS ossClient;
 
-    public PDFGenerationTool(AliyunOssProperties properties) {
+    public PDFGenerationTool(AliyunOssProperties properties, ResourceRecorder resourceRecorder) {
         this.properties = properties;
+        this.resourceRecorder = resourceRecorder;
         // 配置里可能写了 https://，也可能只写了域名，统一剥成裸域名
         this.endpointHost = properties.getEndpoint() == null
                 ? ""
@@ -58,7 +67,8 @@ public class PDFGenerationTool {
             + "生成好之后，务必把返回的下载链接原样放进你的最终回答里，用户要靠它去下载。")
     public String pdfGenerate(
             @ToolParam(description = "保存的文件名，例如 一周食谱.pdf，不要带路径") String fileName,
-            @ToolParam(description = "要写进 PDF 的完整内容，支持换行") String content) {
+            @ToolParam(description = "要写进 PDF 的完整内容，支持换行") String content,
+            ToolContext toolContext) {
 
         if (!properties.isConfigured()) {
             log.warn("[PDFGenerationTool] 被调用，但 aliyun.oss.* 没有配齐，无法生成 PDF");
@@ -88,9 +98,25 @@ public class PDFGenerationTool {
             metadata.setContentLength(bytes.length);
             client().putObject(properties.getBucket(), objectKey, new ByteArrayInputStream(bytes), metadata);
 
-            String url = "https://" + properties.getBucket() + "." + endpointHost + "/" + objectKey;
+            // 文件名是模型给的，多半带中文（「一周食谱.pdf」），而中文直接进 URL 是非法字符：
+            // 浏览器多半会自己兜住，但链接一旦被复制到别处（聊天软件、邮件客户端）就未必了。
+            // ResourceDownloadTool 早就为此编码过，这条路当时漏了。
+            //
+            // 用 encodePath 而不是 encodePathSegment：objectKey 是 "pdf/xxx_名字.pdf" 这种
+            // 带斜杠的形式，而 encodePathSegment 会把斜杠也编成 %2F，等于毁掉目录结构。
+            // 注意只编 URL——OSS 的 objectKey 是字面量键，必须保持原样，编了就对不上了
+            String url = "https://" + properties.getBucket() + "." + endpointHost + "/"
+                    + UriUtils.encodePath(objectKey, StandardCharsets.UTF_8);
             log.info("[PDFGenerationTool] 已生成 PDF：{}（{} 字节）", url, bytes.length);
-            return "PDF 已生成，下载链接：" + url;
+
+            // 归档到资料库。放在 return 之前、且不参与返回值——
+            // 记不上账不该影响用户拿到的这句话（recorder 内部兜住了异常）
+            resourceRecorder.record(toolContext, ResourceKind.PDF, safeName, url, objectKey,
+                    (long) bytes.length, "application/pdf", null);
+
+            // 说清楚「原样抄进回答」，因为这句话会被模型转述成给用户的答复。
+            // 只说「已生成」的话，模型很容易回一句「生成好了」就把链接吞了
+            return "PDF 已生成。下载链接如下，请原样抄进最终回答、单独占一行：\n" + url;
         } catch (Exception exception) {
             // 这里必须带上异常信息：上传失败几乎都是凭证、Bucket 名或权限的问题，
             // 只说一句「生成失败」的话，用户和开发者都无从下手

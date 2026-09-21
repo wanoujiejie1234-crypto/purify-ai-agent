@@ -3,6 +3,7 @@ import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import AuthShell from '../components/AuthShell.vue'
 import * as authApi from '../api/auth.js'
+import { message, rawMessage, resolveMessage } from '../i18n/index.js'
 
 /**
  * 登录页。
@@ -19,8 +20,11 @@ const router = useRouter()
 
 const username = ref('')
 const password = ref('')
-const error = ref('')
+/** 存的是描述符不是句子，见 i18n/index.js 的 message()：存句子的话切语言不会跟着变 */
+const error = ref(null)
 const submitting = ref(false)
+
+const errorText = computed(() => resolveMessage(error.value))
 
 /**
  * 登录成功后该去哪儿。
@@ -39,14 +43,14 @@ const redirectTo = computed(() => {
 
 async function submit() {
   if (submitting.value) return
-  error.value = ''
+  error.value = null
 
   if (!username.value.trim()) {
-    error.value = '请输入用户名'
+    error.value = message('auth.login.needUsername')
     return
   }
   if (!password.value) {
-    error.value = '请输入密码'
+    error.value = message('auth.login.needPassword')
     return
   }
 
@@ -59,7 +63,7 @@ async function submit() {
   } catch (err) {
     // 后端对「用户名不存在」和「密码不对」返回的是同一句话，这是有意的
     // （否则这个接口就成了一个账号枚举器）。所以这里原样显示即可，不用自己再包装
-    error.value = err.message || '登录失败，请稍后重试。'
+    error.value = err.message ? rawMessage(err.message) : message('auth.login.failed')
     // 只清密码，留着用户名——多数情况是密码打错了，让人重打一遍用户名没必要
     password.value = ''
   } finally {
@@ -69,25 +73,25 @@ async function submit() {
 </script>
 
 <template>
-  <AuthShell title="登录" subtitle="登录后才能开始对话、查看自己的历史记录。">
+  <AuthShell :title="$t('auth.login.title')" :subtitle="$t('auth.login.subtitle')">
     <form @submit.prevent="submit">
       <label class="field">
-        <span class="field-label">用户名</span>
+        <span class="field-label">{{ $t('auth.login.username') }}</span>
         <input
           v-model="username"
           class="field-input"
           type="text"
           name="username"
           autocomplete="username"
-          placeholder="请输入用户名"
+          :placeholder="$t('auth.login.usernamePlaceholder')"
           :disabled="submitting"
         />
       </label>
 
       <label class="field">
         <span class="field-label">
-          密码
-          <RouterLink to="/forgot" class="field-hint">忘记密码？</RouterLink>
+          {{ $t('auth.login.password') }}
+          <RouterLink to="/forgot" class="field-hint">{{ $t('auth.login.forgot') }}</RouterLink>
         </span>
         <input
           v-model="password"
@@ -95,20 +99,20 @@ async function submit() {
           type="password"
           name="password"
           autocomplete="current-password"
-          placeholder="请输入密码"
+          :placeholder="$t('auth.login.passwordPlaceholder')"
           :disabled="submitting"
         />
       </label>
 
-      <p v-if="error" class="form-error">{{ error }}</p>
+      <p v-if="errorText" class="form-error">{{ errorText }}</p>
 
       <button class="btn-primary" type="submit" :disabled="submitting">
-        {{ submitting ? '登录中…' : '登录' }}
+        {{ submitting ? $t('auth.login.submitting') : $t('auth.login.submit') }}
       </button>
     </form>
 
     <template #footer>
-      还没有账号？<RouterLink to="/register">去注册</RouterLink>
+      {{ $t('auth.login.noAccount') }}<RouterLink to="/register">{{ $t('auth.login.toRegister') }}</RouterLink>
     </template>
   </AuthShell>
 </template>

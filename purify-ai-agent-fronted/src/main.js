@@ -3,6 +3,8 @@ import App from './App.vue'
 import router from './router'
 import * as auth from './auth.js'
 import { fetchMe } from './api/auth.js'
+import { i18n, restoreLocale } from './i18n/index.js'
+import { restoreTheme, enterChatPage } from './theme.js'
 import './styles/base.css'
 
 /**
@@ -15,7 +17,43 @@ import './styles/base.css'
  */
 auth.restore()
 
-createApp(App).use(router).mount('#app')
+/**
+ * 主题也要在挂载之前恢复，理由和上面那条一样是「时序」：
+ * 放到组件里读的话，深色用户每次刷新都会先看到一帧浅色再跳成深色。
+ */
+restoreTheme()
+
+/**
+ * 语言同理，而且比主题更需要抢在前面：
+ * 恢复到挂载之后的话，英文用户每次刷新都会先看到一帧中文，
+ * 然后整页文字当着面换一遍——比颜色闪一下显眼得多。
+ *
+ * 放在 `app.use(i18n)` 之前调没有关系：`restoreLocale` 改的是
+ * `i18n.global.locale`，插件装上去读的就是那个已经改好的值。
+ */
+restoreLocale()
+
+/**
+ * 直接落在对话页上的那次刷新，还要再往前抢一帧。
+ *
+ * 深色只在对话页生效，而 `ChatRoom` 是异步 chunk——挂载它要等 chunk 下载完，
+ * 在那之前 `<html>` 上还没有 `theme-dark`，body 是浅色的。用户看到的就是
+ * 「刷新 → 闪一下白 → 变深」。ChatRoom 自己的 setup 里虽然也调了
+ * `enterChatPage()`，但那时候首帧已经画完了。
+ *
+ * 这里按路由判断一次（路由表里 `meta.chatTheme` 标了哪几个页面吃深色），
+ * 把那一帧也盖住。ChatRoom 里那次调用保留着：它管的是**从别的页面点进来**
+ * 的情况，那时候这儿还没跑过。
+ *
+ * 还要带上登录判断：未登录时对话页会被路由守卫弹到登录页，而那次跳转发生在
+ * 挂载之后——不加这一条的话，`theme-dark` 会挂在一个从来没出现过对话页的会话上，
+ * 登录页背后那层 body 就变成深色了。
+ */
+if (auth.isLoggedIn() && router.resolve(window.location.pathname).meta?.chatTheme) {
+  enterChatPage()
+}
+
+createApp(App).use(i18n).use(router).mount('#app')
 
 /**
  * 挂载之后再去服务端问一次「这个令牌还有效吗」。

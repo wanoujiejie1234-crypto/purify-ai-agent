@@ -26,6 +26,7 @@ public class AdvisorConfig {
         return new SensitiveWordChecker(
                 properties.getWords(),
                 properties.getReplyMessage(),
+                properties.getReplyMessageEn(),
                 properties.isEnabled());
     }
 

@@ -49,7 +49,10 @@ public class SensitiveWordAdvisor implements CallAdvisor, StreamAdvisor {
             return chain.nextCall(request);
         }
         log.warn("[SensitiveWordAdvisor] 命中敏感词 [{}]，已拦截本次请求，不调用模型", hit);
-        throw new SensitiveWordException(hit, checker.replyMessage());
+        // 只带「命中了哪个词」，不带话术：这里（流式用法下）跑在 Reactor 线程上，
+        // 读 LocaleContextHolder 会静默回落成默认语言。话术由展示它的那一层取，
+        // 那里要么在请求线程上、要么手里有捕获好的 locale。见 SensitiveWordException 的类注释
+        throw new SensitiveWordException(hit);
     }
 
     @Override
@@ -59,7 +62,7 @@ public class SensitiveWordAdvisor implements CallAdvisor, StreamAdvisor {
             return chain.nextStream(request);
         }
         log.warn("[SensitiveWordAdvisor] 命中敏感词 [{}]，已拦截本次流式请求，不调用模型", hit);
-        return Flux.error(new SensitiveWordException(hit, checker.replyMessage()));
+        return Flux.error(new SensitiveWordException(hit));
     }
 
     /** 取 Prompt 中最后一条用户消息的文本。扫描范围与智能体那边共用一份实现，见 Checker 的注释。 */

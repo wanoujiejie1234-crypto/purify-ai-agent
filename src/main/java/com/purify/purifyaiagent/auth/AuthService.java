@@ -101,10 +101,10 @@ public class AuthService {
         // 查重放在事务外：它只是一次「能不能给出更好的提示」的判断，
         // 不需要事务保护，也就没必要占着连接
         if (userRepository.usernameExists(username)) {
-            throw ApiException.authInvalid("用户名「" + username + "」已经被占用了，换一个吧");
+            throw ApiException.authInvalid("error.auth.usernameTaken", username);
         }
         if (userRepository.emailExists(email)) {
-            throw ApiException.authInvalid("这个邮箱已经注册过了，直接登录或用「忘记密码」找回");
+            throw ApiException.authInvalid("error.auth.emailTaken");
         }
 
         // 密码哈希也在事务外算：BCrypt 是刻意设计成慢的（几十到几百毫秒），
@@ -122,7 +122,7 @@ public class AuthService {
             // 消费验证码。CAS 失败说明它刚被另一个请求用掉了，这时必须报错而不是放行——
             // 放行就等于一次验证码换两个账号
             if (!verifyCodeService.consume(codeId)) {
-                throw ApiException.authInvalid("这个验证码已经用过了，请重新获取");
+                throw ApiException.authInvalid("error.auth.codeUsed");
             }
             try {
                 return userRepository.insert(username, hash, email, nickname, UserRole.NORMAL);
@@ -132,7 +132,7 @@ public class AuthService {
                 // 那次消费也跟着撤销——用户可以拿同一个验证码换个用户名重试，
                 // 而不是被迫等 60 秒重发。转成 400 而不是让它变成 500：
                 // 这是一个客户端可以自己解决的情况，不是服务端故障
-                throw ApiException.authInvalid("用户名或邮箱已经被占用了，换一个再试");
+                throw ApiException.authInvalid("error.auth.usernameOrEmailTaken");
             }
         });
 
@@ -163,19 +163,19 @@ public class AuthService {
         if (found.isEmpty()) {
             passwordEncoder.matches(password, DUMMY_HASH);
             log.debug("[Auth] 登录失败：用户名不存在");
-            throw ApiException.authInvalid("用户名或密码不正确");
+            throw ApiException.authInvalid("error.auth.badCredentials");
         }
 
         UserAccount account = found.get();
         if (!passwordEncoder.matches(password, account.password())) {
             log.debug("[Auth] 登录失败：密码不正确 userId={}", account.id());
-            throw ApiException.authInvalid("用户名或密码不正确");
+            throw ApiException.authInvalid("error.auth.badCredentials");
         }
 
         if (!account.canLogin()) {
             // 密码是对的，所以这里可以放心地告诉对方账号的真实状态——
             // 能通过密码验证的人本来就是账号主人
-            throw ApiException.authInvalid("这个账号不可用（已被禁用或删除），请联系管理员");
+            throw ApiException.authInvalid("error.auth.accountUnavailable");
         }
 
         userRepository.touchLogin(account.id(), clientIp);
@@ -209,7 +209,7 @@ public class AuthService {
         // 在这里假装成功，用户会以为密码改好了，然后用新密码登录失败，白折腾一轮。
         // （发送验证码那一步是另一回事，那里确实不该泄露，见 AuthController#sendCode）
         if (found.isEmpty()) {
-            throw ApiException.authInvalid("这个邮箱没有注册过账号");
+            throw ApiException.authInvalid("error.auth.emailNotRegistered");
         }
 
         String hash = passwordEncoder.encode(password);
@@ -221,7 +221,7 @@ public class AuthService {
 
         transactionTemplate.executeWithoutResult(status -> {
             if (!verifyCodeService.consume(codeId)) {
-                throw ApiException.authInvalid("这个验证码已经用过了，请重新获取");
+                throw ApiException.authInvalid("error.auth.codeUsed");
             }
             userRepository.updatePassword(account.id(), hash);
         });
@@ -239,12 +239,11 @@ public class AuthService {
      */
     private static String requireUsername(String username) {
         if (!StringUtils.hasText(username)) {
-            throw ApiException.authInvalid("用户名不能为空");
+            throw ApiException.authInvalid("error.auth.usernameRequired");
         }
         String trimmed = username.trim();
         if (trimmed.length() < USERNAME_MIN_LENGTH || trimmed.length() > USERNAME_MAX_LENGTH) {
-            throw ApiException.authInvalid(
-                    "用户名长度要在 " + USERNAME_MIN_LENGTH + "-" + USERNAME_MAX_LENGTH + " 个字符之间");
+            throw ApiException.authInvalid("error.auth.usernameLength", USERNAME_MIN_LENGTH, USERNAME_MAX_LENGTH);
         }
         return trimmed;
     }
@@ -261,10 +260,10 @@ public class AuthService {
      */
     private static String requirePassword(String password) {
         if (!StringUtils.hasText(password)) {
-            throw ApiException.authInvalid("密码不能为空");
+            throw ApiException.authInvalid("error.auth.passwordRequired");
         }
         if (password.length() < PASSWORD_MIN_LENGTH) {
-            throw ApiException.authInvalid("密码至少 " + PASSWORD_MIN_LENGTH + " 位");
+            throw ApiException.authInvalid("error.auth.passwordTooShort", PASSWORD_MIN_LENGTH);
         }
         return password;
     }
@@ -273,17 +272,17 @@ public class AuthService {
     private static String requireEmail(String email) {
         String normalized = UserRepository.normalizeEmail(email);
         if (!StringUtils.hasText(normalized)) {
-            throw ApiException.authInvalid("邮箱不能为空");
+            throw ApiException.authInvalid("error.auth.emailRequired");
         }
         // 只做最基本的形状检查。**故意不用复杂的邮箱正则**：它们几乎都是错的
         // （真正合法的地址比大多数人以为的宽松得多），错杀一个合法地址的代价
         // 是用户根本注册不了，而多收一个畸形地址的代价只是那封邮件发不出去
         if (!normalized.contains("@") || normalized.startsWith("@") || normalized.endsWith("@")) {
-            throw ApiException.authInvalid("邮箱格式不正确");
+            throw ApiException.authInvalid("error.auth.emailInvalid");
         }
         // 长度必须在入口挡住，交给数据库拦会变成 500，理由见 EMAIL_MAX_LENGTH
         if (normalized.length() > EMAIL_MAX_LENGTH) {
-            throw ApiException.authInvalid("邮箱太长了，最多 " + EMAIL_MAX_LENGTH + " 个字符");
+            throw ApiException.authInvalid("error.auth.emailTooLong", EMAIL_MAX_LENGTH);
         }
         return normalized;
     }
@@ -300,7 +299,7 @@ public class AuthService {
         }
         String trimmed = nickname.trim();
         if (trimmed.length() > NICKNAME_MAX_LENGTH) {
-            throw ApiException.authInvalid("昵称最多 " + NICKNAME_MAX_LENGTH + " 个字符");
+            throw ApiException.authInvalid("error.auth.nicknameTooLong", NICKNAME_MAX_LENGTH);
         }
         return trimmed;
     }

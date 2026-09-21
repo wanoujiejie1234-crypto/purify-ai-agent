@@ -1,15 +1,13 @@
 package com.purify.purifyaiagent.agent;
 
 import com.purify.purifyaiagent.agent.loop.LoopSignal;
-import com.purify.purifyaiagent.agent.loop.LoopType;
 import com.purify.purifyaiagent.agent.tool.HumanInterrupt;
+import com.purify.purifyaiagent.i18n.Messages;
 import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.UserMessage;
 
 import java.util.ArrayList;
-import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Set;
 
 /**
  * 一次 run 的<b>全部可变状态</b>：跑到第几步、说过什么、被拦过几次、要不要等用户回答。
@@ -40,10 +38,23 @@ public final class AgentRun {
      */
     private final String userId;
 
+    /**
+     * 这次 run 该用哪种语言讲话，已经绑好。
+     *
+     * <p><b>为什么必须跟着 run 走，而不是在用到的地方现取</b>：run 的事件流跑在 Reactor 的
+     * 调度线程上（见 {@code BaseAgent#runStream} 的 {@code subscribeOn}），请求线程上的
+     * {@code LocaleContextHolder} 在那里不可见。现取不会报错，只会静默地回落成
+     * JVM 默认语言——表现是「英文界面上，智能体跑到一半冒出几句中文」。
+     * 这和 {@link #userId} 是同一个坑，所以处理方式也一样：请求线程上取一次，往下带。
+     *
+     * <p>放的是 {@link Messages} 而不是 {@code Locale}：拿到它的人不用再去找
+     * {@code MessageSource}，也就没有「又要注入一个 Bean、又只能在请求线程上取」的机会。
+     */
+    private final Messages i18n;
+
     private final List<Message> messages;
     private final List<AgentStep> steps = new ArrayList<>();
     private final List<String> hints = new ArrayList<>();
-    private final Set<LoopType> loopTypes = new LinkedHashSet<>();
     private final HumanInterrupt interrupt = new HumanInterrupt();
 
     /**
@@ -64,9 +75,10 @@ public final class AgentRun {
     private int loopHits = 0;
     private boolean streaming = false;
 
-    private AgentRun(String chatId, String userId, List<Message> history, String input) {
+    private AgentRun(String chatId, String userId, Messages i18n, List<Message> history, String input) {
         this.chatId = chatId;
         this.userId = userId;
+        this.i18n = i18n;
         this.messages = new ArrayList<>(history);
         // 用户这句话先落进工作列表：万一下一步就崩了，记忆里也还留着这次提问
         this.messages.add(new UserMessage(input));
@@ -80,9 +92,12 @@ public final class AgentRun {
      *                但 HTTP 入口在鉴权那一步就已经挡住了这种情况
      * @param history 这个会话已有的消息（来自 {@code AgentMemory}），会被拷进工作列表；
      *                外面那份不受影响——run 跑到一半失败时，记忆里保留的还是上一次完整的状态
+     * @param i18n    这次 run 该用哪种语言。**必须在请求线程上取好再传进来**，
+     *                理由见 {@link #i18n} 字段的说明
      */
-    public static AgentRun start(String chatId, String userId, String input, List<Message> history) {
-        return new AgentRun(chatId, userId, history, input);
+    public static AgentRun start(String chatId, String userId, Messages i18n,
+                                 String input, List<Message> history) {
+        return new AgentRun(chatId, userId, i18n, history, input);
     }
 
     public String chatId() {
@@ -98,6 +113,16 @@ public final class AgentRun {
      */
     public String userId() {
         return userId;
+    }
+
+    /**
+     * 这次 run 的文案出口，已经绑好语言。
+     *
+     * <p>凡是产出**给用户看的文案**的地方（看门狗话术、步数预算说明、模型调用失败的兜底），
+     * 都从这里取，不要在那些地方读 {@code LocaleContextHolder}——理由见 {@link #i18n}。
+     */
+    public Messages i18n() {
+        return i18n;
     }
 
     /** 正在拼装的工作消息列表（不含系统提示词）。每一步结束后由 {@code BaseAgent} 交给记忆保存。 */
@@ -157,10 +182,6 @@ public final class AgentRun {
         return loopHits;
     }
 
-    public List<LoopType> loopTypes() {
-        return List.copyOf(loopTypes);
-    }
-
     /** 这次 run 是不是走的流式模型调用。两条路都用流式会有另一套风险，见 {@code ToolCallAgent#think}。 */
     public boolean streaming() {
         return streaming;
@@ -183,9 +204,16 @@ public final class AgentRun {
         this.hints.add(hint);
     }
 
-    public void recordLoopHit(LoopSignal signal) {
+    /**
+     * 记一次循环命中。
+     *
+     * <p>只记次数。命中的是<b>哪一种</b>循环、证据是什么，已经在 {@code LoopGuard} 那条 warn
+     * 日志里连证据一起打出去了（{@link LoopSignal#describe()}）——那才是排查时看的地方。
+     * 这里原先还攒了一份去重后的种类集合，一路传到 {@code AgentResult}，但从加进来起
+     * 就没有任何读取方，属于纯预留，已删。
+     */
+    public void recordLoopHit() {
         this.loopHits++;
-        this.loopTypes.add(signal.type());
     }
 
     /** 最近一步模型说的话；一步都没走时是空串。给「问用户」和「中止」的文案用来交代上下文。 */
@@ -213,6 +241,6 @@ public final class AgentRun {
     }
 
     public AgentResult toResult() {
-        return new AgentResult(chatId, state, output, question(), steps.size(), loopHits, loopTypes());
+        return new AgentResult(chatId, state, output, question(), steps.size(), loopHits);
     }
 }

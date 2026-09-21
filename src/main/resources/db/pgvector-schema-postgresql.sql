@@ -9,7 +9,7 @@
 --       CREATE EXTENSION IF NOT EXISTS vector
 --       CREATE EXTENSION IF NOT EXISTS hstore        <-- 无条件执行
 --       以及 idType 为 uuid 时的 CREATE EXTENSION IF NOT EXISTS "uuid-ossp"
---   阿里云 RDS 的普通账号未必有建扩展的权限，hstore 这一句会让应用启动直接失败
+--   应用连库的账号未必有建扩展的权限（托管实例上更常见），hstore 这一句会让应用启动直接失败
 --   （permission denied to create extension "hstore"），而报错信息看不出问题出在 hstore。
 --   本项目已经用 id-type: text 避开了 uuid-ossp，剩下的 vector 和 hstore 交给有权限的账号
 --   执行一次即可。执行完把它配成 false 启动，行的就是这份脚本建出来的表。
@@ -85,3 +85,65 @@ CREATE INDEX IF NOT EXISTS rag_knowledge_chunk_source_idx
 --   EXPLAIN ANALYZE SELECT id FROM public.rag_knowledge_chunk
 --     WHERE metadata::jsonb @@ '$.classification == "食物热量"'::jsonpath;
 -- 输出里出现 Bitmap Index Scan 就是命中了，仍是 Seq Scan 说明没匹配上。
+
+
+-- ============ 6. 关键词检索（pg_bigm，可选） ============
+-- 新增的那一路「关键词检索」靠这个索引加速 content LIKE '%词%'。
+--
+-- ⚠ 整段默认注释掉，因为 pg_bigm 是**静态加载**的扩展，装它要动服务端配置：
+--     1) 把 pg_bigm 加进 postgresql.conf 的 shared_preload_libraries
+--     2) 重启 PostgreSQL            <-- 这一步没法在 SQL 里做，所以放进注释而不是脚本
+--     3) 用超级用户执行 CREATE EXTENSION pg_bigm;
+--   没做这几步时执行这一段会报 could not open extension control file。
+--
+--   自建的库直接改 postgresql.conf 即可；托管实例（阿里云 RDS 等）通常不给改这个参数，
+--   那就走 6b 的 pg_trgm 退路。
+--
+--   版本要求：PG 10~15 需内核小版本 >= 20230830，PG 16 不限，PG 17 需 >= 20250830。
+--
+--   **应用侧是安全的**：启动时会主动探测，探不到就把这一路停用并打一条能照着做的
+--   WARN，退化成纯向量检索，不会启动失败。见 PgKeywordSearcher。
+--
+--   为什么必须「主动探测」而不能「用的时候报错再说」：应用侧那条 SQL 只引用
+--   PostgreSQL 核心操作符（LIKE / length / ->>），**不调用任何 pg_bigm 函数**。
+--   所以扩展没装时查询**会成功**、只是退化成整表扫描——不探测的话没人会发现。
+
+-- CREATE EXTENSION IF NOT EXISTS pg_bigm;
+
+-- 2-gram GIN 索引。gin_bigm_ops 是 pg_bigm 提供的 operator class，
+-- 也是 LIKE '%x%' 能走索引的全部原因 —— btree 对前导通配符完全无用。
+--
+-- 只建在 content 上：关键词那一路只匹配正文，不匹配元数据。
+-- FASTUPDATE 保持默认 on：知识库是「一次写入、多次读取」，把待处理条目留在
+-- pending list 里反而更划算。
+--
+-- 改了 table-name 的话，索引名和 purify.rag.pgvector.keyword.index-name 要一起改
+-- （后者留空时会按 <table-name>_bigm_idx 自动推导，所以默认不用管）。
+-- CREATE INDEX IF NOT EXISTS rag_knowledge_chunk_bigm_idx
+--     ON public.rag_knowledge_chunk USING gin (content gin_bigm_ops);
+
+-- 建完确认它真的被用上（出现 Bitmap Index Scan 才算命中）：
+--   EXPLAIN (ANALYZE, BUFFERS) SELECT id FROM public.rag_knowledge_chunk
+--     WHERE content LIKE '%利拉鲁肽%';
+-- 仍是 Seq Scan 多半是表太小——几百行的表全表扫本来就更快，属正常。
+--
+-- 若加了索引却仍走 Seq Scan（表不小的情况下），可能是规划器对参数化的
+-- LIKE ? 估错了选择率。此时把 purify.rag.pgvector.keyword.inline-patterns
+-- 改成 true 再测一次——那会让检索词成为计划期常量。
+
+
+-- ============ 6b. 兜底：pg_trgm（不需要重启实例） ============
+-- 托管实例常常不给改 shared_preload_libraries，那时 pg_bigm 就装不上。
+-- pg_trgm 是普通扩展，**装它不用重启**，中文效果差一些但比关掉这一路好。
+--
+-- 换过去只需要两步 SQL + 两项配置，**Java 侧一行都不用改**
+-- （应用发的还是同一个 content LIKE ?）：
+--     CREATE EXTENSION IF NOT EXISTS pg_trgm;
+--     CREATE INDEX IF NOT EXISTS rag_knowledge_chunk_trgm_idx
+--         ON public.rag_knowledge_chunk USING gin (content gin_trgm_ops);
+-- 然后改配置：
+--     purify.rag.pgvector.keyword.index-name: rag_knowledge_chunk_trgm_idx
+--     purify.rag.pgvector.keyword.min-term-length: 3    # 3-gram 对 2 字词提不出 trigram
+--
+-- 注意 pg_trgm 在 lc_ctype=C 的库上会退化（非字母数字被过滤掉，中文基本上提不出 trigram）。
+-- 上之前先确认：SELECT show_trgm('中国'); —— 返回空 {} 就说明这个库用不了。

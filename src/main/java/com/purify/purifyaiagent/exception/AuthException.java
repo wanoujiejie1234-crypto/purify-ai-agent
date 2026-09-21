@@ -35,25 +35,36 @@ public class AuthException extends RuntimeException {
     private final String code;
     private final HttpStatus status;
 
-    private AuthException(String code, HttpStatus status, String message) {
-        super(message);
+    /** 文案在 {@code messages*.properties} 里的键，**不是**给用户看的那句话。理由同 {@code ApiException}。 */
+    private final String messageKey;
+
+    /** 填进文案占位符的参数。 */
+    private final Object[] args;
+
+    private AuthException(String code, HttpStatus status, String messageKey, Object[] args) {
+        // 传键本身，于是 getMessage() 拿到的是键——日志里方便定位到是哪条分支
+        super(messageKey);
         this.code = code;
         this.status = status;
+        this.messageKey = messageKey;
+        this.args = args == null ? new Object[0] : args;
     }
 
     /**
      * 401：没能证明身份。
      *
-     * <p>{@code message} 会被原样显示给用户，所以两件事要注意：
+     * <p>键指向的那句话会被原样显示给用户，所以两件事要注意：
      * 别把「令牌签名不对」这种内部细节写进去（对用户没有意义，对攻击者反而有用），
      * 也别写「用户不存在」——那是个账号枚举口子。统一说「登录已失效，请重新登录」。
+     *
+     * @param messageKey {@code messages*.properties} 里的键
      */
-    public static AuthException unauthorized(String message) {
-        return new AuthException(UNAUTHORIZED, HttpStatus.UNAUTHORIZED, message);
+    public static AuthException unauthorized(String messageKey, Object... args) {
+        return new AuthException(UNAUTHORIZED, HttpStatus.UNAUTHORIZED, messageKey, args);
     }
 
     /** 403：身份没问题，权限不够。 */
-    public static AuthException forbidden(String message) {
-        return new AuthException(FORBIDDEN, HttpStatus.FORBIDDEN, message);
+    public static AuthException forbidden(String messageKey, Object... args) {
+        return new AuthException(FORBIDDEN, HttpStatus.FORBIDDEN, messageKey, args);
     }
 }

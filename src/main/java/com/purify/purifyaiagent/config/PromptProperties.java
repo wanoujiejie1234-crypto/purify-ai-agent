@@ -23,6 +23,14 @@ public class PromptProperties {
      */
     private String location = "classpath:prompts/";
 
-    /** 系统提示词里对用户的称呼，可以通过 {nickname} 变量注入模板。 */
+    /** 系统提示词里对用户的称呼（中文），可以通过 {nickname} 变量注入模板。 */
     private String nickname = "朋友";
+
+    /**
+     * 英文模板里的称呼。留空表示沿用 {@link #nickname}。
+     *
+     * <p>不放进 {@code messages*.properties} 是因为它和上面的中文那份是**一对配置**：
+     * 产品同学改称呼时想改的是「系统提示词里怎么叫用户」，两处放在一起才找得全。
+     */
+    private String nicknameEn = "there";
 }

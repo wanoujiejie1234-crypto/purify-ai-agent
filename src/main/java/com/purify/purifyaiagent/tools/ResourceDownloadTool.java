@@ -2,6 +2,9 @@ package com.purify.purifyaiagent.tools;
 
 import cn.hutool.core.io.FileUtil;
 import cn.hutool.http.HttpUtil;
+import com.purify.purifyaiagent.resource.ResourceKind;
+import com.purify.purifyaiagent.resource.ResourceRecorder;
+import org.springframework.ai.chat.model.ToolContext;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.util.StringUtils;
@@ -23,14 +26,20 @@ public class ResourceDownloadTool {
     /** 本地文件对外暴露的地址前缀，形如 http://localhost:8123/api */
     private final String baseUrl;
 
-    public ResourceDownloadTool(String baseUrl) {
+    /** 下载成功之后往资料库记一笔。见 {@code ResourceRecorder}——它不抛异常，不会拖累本工具。 */
+    private final ResourceRecorder resourceRecorder;
+
+    public ResourceDownloadTool(String baseUrl, ResourceRecorder resourceRecorder) {
         //配置里可能带结尾的 /，拼 URL 时先剥掉，否则会拼出 //files/download
         this.baseUrl = baseUrl == null ? "" : baseUrl.replaceAll("/+$", "");
+        this.resourceRecorder = resourceRecorder;
     }
 
     @Tool(description = "Download a resource from a given url and return its download URL. "
             + "Always include the returned download URL in your final answer so the user can click it.")
-    public String downloadResource(@ToolParam(description = "URL of the resource to download") String url,@ToolParam(description = "Name of the file to save download resource")String fileName){
+    public String downloadResource(@ToolParam(description = "URL of the resource to download") String url,
+                                   @ToolParam(description = "Name of the file to save download resource") String fileName,
+                                   ToolContext toolContext) {
         if (!StringUtils.hasText(url)) {
             return "Error downloading resource: the url is empty. Please provide a valid http(s) url.";
         }
@@ -47,12 +56,20 @@ public class ResourceDownloadTool {
         for (int i = 0; i < 3; i++) {
             try {
                 HttpUtil.downloadFile(url, new File(filePath), TIMEOUT_MS);
+
                 //只回文件名等于把用户堵在本地磁盘上：这里补一条后端可直接打开的链接，
                 //否则模型只能转述"下载好了"，用户在浏览器里没有任何可点的东西。
                 //落盘用的是解码后的裸文件名，URL 这边要重新编码，否则中文名会对不上
-                return "resource downloading successfully:" + filePath
-                        + "\nDownload URL: " + baseUrl + "/files/download/"
+                String downloadUrl = baseUrl + "/files/download/"
                         + UriUtils.encodePathSegment(safeName, StandardCharsets.UTF_8);
+
+                // 归档到资料库。源地址（url）也一起记下来——用户回头看的时候
+                // 「这份东西是从哪抓的」往往比文件本身还有用
+                resourceRecorder.record(toolContext, ResourceKind.DOWNLOAD, safeName,
+                        downloadUrl, safeName, new File(filePath).length(), null, url);
+
+                return "resource downloading successfully:" + filePath
+                        + "\nDownload URL: " + downloadUrl;
             } catch (Exception e) {
                 lastError = e.getMessage();
             }

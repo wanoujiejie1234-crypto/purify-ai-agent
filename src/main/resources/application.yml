@@ -62,6 +62,9 @@ spring:
         # 用户与邮箱验证码。脚本里还有一段注释掉的老数据清理 SQL，
         # 以及「为什么 role 列和两个唯一索引要交给 SchemaGuard 补」的说明
         - classpath:db/auth-schema-mysql.sql
+        # 资料库：智能体产出的文件和链接。为什么不去正则扫 chat_record.answer，
+        # 而是单建一张表并让工具在产出时自己记一笔，写在脚本注释里
+        - classpath:db/user-resource-schema-mysql.sql
 
   ai:
     # ---------------- 对话记忆：官方 JdbcChatMemoryRepository ----------------
@@ -168,6 +171,10 @@ purify:
       - 泻药
       - 绝食
     reply-message: "你提到的情况已经超出我作为健康顾问能处理的范围了。比起体重，你的身心健康更重要，建议尽快联系专业医生或心理咨询师聊一聊。全国心理援助热线：12356。"
+    # 英文界面用的话术。**这条不是可选的美化**：它是命中的那一刻用户唯一看到的
+    # 东西，留空会退回中文那份，英文用户会突然收到一大段看不懂的字。
+    # 两个国家的心理援助热线不一样，所以英文那份写的是国际通用的说法，没写号码。
+    reply-message-en: "What you're describing is beyond what I can help with as a health advisor. Your wellbeing matters more than your weight — please talk to a doctor or a counsellor soon. If you're in crisis, your local emergency number or a crisis line can help right away."
 
   # ---------------- 应用自身的对外地址 ----------------
   # 下载工具要把本地文件变成一个用户点得开的链接，而它不在 HTTP 请求上下文里，
@@ -182,6 +189,9 @@ purify:
     location: classpath:prompts/
     # slim-app-system.st 里 {nickname} 的取值
     nickname: 朋友
+    # 英文模板（*-en.st）里的取值。留空会退回上面那个中文的，
+    # 那样英文用户会在系统提示词里被叫「朋友」——模型多半会照着用
+    nickname-en: there
 
   # ---------------- PurifyManus：自己驱动循环的 ReAct 智能体 ----------------
   # 和上面的 slim 应用并列的一条链路（/api/manus/*），互不影响：
@@ -338,6 +348,32 @@ purify:
       # 如果发现这类问题答得不好，改成 true。
       query-all-when-unmatched: false
 
+    # ---------------- 百炼云知识库同步（仅 store=pgvector 时生效） ----------------
+    # 用百炼控制台的切片效果，但把切片存进本地 pgvector。知识库管理页上那张
+    # 「百炼同步」卡片，读的是这里的配置。
+    #
+    # 走的是阿里云**管控面**接口（ListIndexDocuments / ListChunks），
+    # 和上面那套 DashScope 数据面是两套接口、两套认证——数据面没有任何「列出」语义，
+    # 回答不了「百炼上现在有哪些文件」。认证用的是阿里云 AK/SK，不是 api-key。
+    #
+    # 没配齐不会让应用起不来，只会在那张卡片上显示「还缺哪几项」——
+    # 这个功能只是管理页上的一张卡片，不该拖垮整个应用。
+    bailian:
+      # 管控面接入点。和 OSS 的 endpoint 一样属于环境信息，不是机密
+      endpoint: bailian.cn-beijing.aliyuncs.com
+      # 知识库 ID，百炼控制台里那个形如 otoru9xxxx 的字符串。
+      # **和上面的 index-name 不是一回事**：那个走数据面、用名字换 pipeline_id；
+      # 这里要的是知识库 ID。两者是不是同一个值只能实调一次才知道，
+      # 所以留空没关系——先跑 /api/knowledge/bailian/probe，它会告诉你该填什么
+      index-id:
+      # 管控面用的业务空间 ID。留空则回落到上面的 purify.rag.workspace-id
+      # （两边都是 llm-xxx 形状，文档也说同一个，但那是推断，所以留了个覆盖口）
+      workspace-id:
+      # 文件清单每页几份。百炼那边默认 10，这里给宽一点，少翻几页
+      page-size: 20
+      # 拉切片时每页几片。100 是接口硬上限，调大了不会报错、只会被静默截断
+      chunk-page-size: 100
+
     # ---------------- 本地向量库（仅 store=pgvector 时生效） ----------------
     # 连接串里的真实值放 application-local.yml，这个文件是要进仓库的。
     # 上面的 rerank-min-score / rerank-top-n / enable-reranking 和 router.* 各条链路共用，
@@ -350,7 +386,7 @@ purify:
       schema-name: public
       table-name: rag_knowledge_chunk
       # 主键类型。用 text 而不是上游默认的 uuid：uuid 会让自动建表额外执行一次
-      # CREATE EXTENSION "uuid-ossp"，阿里云 RDS 的账号未必有建扩展的权限
+      # CREATE EXTENSION "uuid-ossp"，而应用连库那个账号未必有建扩展的权限
       id-type: text
       # 距离函数，可选 cosine_distance / euclidean_distance / negative_inner_product
       distance-type: cosine_distance
@@ -362,8 +398,10 @@ purify:
       # 应用启动时会拿模型名去查内置的已知维度表，对不上直接启动失败
       dimensions: 1024
       # 是否让 PgVectorStore 自己建扩展/建表/建索引。
-      # 它会无条件执行 CREATE EXTENSION hstore，RDS 账号没权限的话会让应用起不来，
+      # 它会无条件执行 CREATE EXTENSION hstore，账号没权限的话会让应用起不来，
       # 那时改成 false 并手工执行 db/pgvector-schema-postgresql.sql
+      # （本项目的库是自建的，超级用户跑一次建表脚本即可；这条留着的意义是
+      #   万一哪天换到托管实例上，报错信息会指向 hstore，而问题其实出在权限）
       initialize-schema: true
       # 表结构校验。必须保持 false：校验跑在初始化之前，而表不存在时校验是直接抛异常的，
       # 于是空库上「校验 + 自动建表」这个组合必然启动失败，根本轮不到建表
@@ -396,6 +434,121 @@ purify:
       # 重排模型名。不复用上面的 rerank-model-name：那个填的是百炼平台侧的名字
       # （gte-rerank-hybrid），这里是 DashScope 原生重排接口的模型名，两套不通用
       rerank-model-name: gte-rerank-v2
+
+      # ---------------- 关键词检索（向量之外的第二路） ----------------
+      # 补的是向量检索的短板：专有名词（「利拉鲁肽」这类低频词、新词、缩写）在
+      # embedding 空间里没有稳定的邻域，捞不到就是捞不到。这一路做字面精确匹配，
+      # 两路用 RRF 融合，融合后再过上面那个重排模型。
+      #
+      # 依赖 PostgreSQL 的 pg_bigm 扩展（中文 2-gram 索引）。**它需要改实例参数并重启**，
+      # 所以大概率还没装——没装时应用不会报错，但会在启动日志里打一条能照着做的 WARN，
+      # 并把这一路停用（退化成纯向量检索）。详见 PgKeywordSearcher 的类注释。
+      keyword:
+        # 总闸。关掉就是一行退回纯向量检索
+        enabled: true
+        # 探测不到 pg_bigm 时是否停用这一路。
+        # **默认 true，别改成 false**：本方案的 SQL 不调用任何 pg_bigm 函数，
+        # 所以没装扩展时查询不会报错、只会静默整表扫描——是个看不见的成本。
+        # 想在没扩展的小库上先跑起来才改成 false（几千条以下可以接受）
+        require-extension: true
+        # 「探不到」这个结论的有效期（秒）。过期后下次检索会重新探测。
+        # **可用是稳定的，不可用不是**：探到可用就一直用，探到不可用只认这么久——
+        # 因为判断依据（扩展、索引）全在数据库那边，而人是会去修它的。
+        # 没有这一条的话，修好之后应用仍会说「检测不到」，一直说到重启为止。
+        # 填 0 或负数 = 不重探（退化成纯记忆化）
+        probe-retry-seconds: 60
+        # 关键词索引名。留空则按 <table-name>_bigm_idx 推导，改表名时自动跟随。
+        # 换 pg_trgm 兜底时才需要显式填
+        index-name:
+        # 这一路召回多少条。与 coarse-top-k 对齐：RRF 假设两路长度可比
+        top-k: 20
+        # 一个问题最多拆出几个检索词（同时也是候选集撑多大的上限）
+        max-patterns: 12
+        # 短于这个长度的段直接丢弃：1 个字组不成 2-gram
+        min-term-length: 2
+        # 长于这个长度的段不再整段匹配，只保留 2-gram（见 KeywordTermExtractor 的注释）。
+        # 调大能覆盖更长的专业名词，代价是更长的短语更难被逐字命中
+        max-term-length: 6
+        # 段内 2-gram 展开。关掉 = 只匹配整段短语（精度最高、召回最低），
+        # 候选集被撑爆时的第一根旋钮
+        include-bigrams: true
+        # 停用词，切段时当作切割点。
+        # **单字只收几乎不可能嵌在领域名词内部的虚词**——「用」会切碎「副作用」、
+        # 「能」会切碎「能量」、「有」会切碎「有氧」、「和」会切碎「饱和」，
+        # 这些字都刻意没有收进来。加词之前先把它在领域词汇里搜一遍。
+        # 漏切的代价只是段变长（2-gram 照样召回），错切的代价是那个词再也匹配不上
+        stop-words:
+          - 的
+          - 了
+          - 是
+          - 在
+          - 吗
+          - 呢
+          - 吧
+          - 我
+          - 你
+          - 他
+          - 它
+          - 这
+          - 那
+          - 就
+          - 都
+          - 也
+          - 还
+          - 很
+          - 太
+          - 最
+          - 更
+          - 请
+          - 问
+          - 把
+          - 被
+          - 让
+          - 从
+          - 之
+          - 其
+          - 而
+          - 但
+          - 却
+          - 则
+          - 些
+          - 等
+          - 个
+          - 么
+          - 什
+          - 怎
+          - 样
+          - 哪
+          - 多
+          - 少
+          - 什么
+          - 怎么
+          - 怎样
+          - 如何
+          - 哪些
+          - 多少
+          - 是否
+          - 有没有
+          - 吃
+          - 喝
+          - 一天
+          - 比较
+          - 可以
+        # 逃生门：把检索词内联成 SQL 字面量而不是走 ? 占位符。
+        # 只有在实测发现参数化的 LIKE ? 让规划器不肯走 GIN 索引时才打开
+        inline-patterns: false
+
+      # ---------------- RRF 融合 ----------------
+      # score = Σ 1/(k + 名次)。用名次而不是分数，因为两路的分数根本不可比
+      # （一个是余弦距离，一个是命中词数），而「排第几」是可比的
+      rrf:
+        # 平滑常数，原论文值。它压平第一名和第十名的差距，于是「两路都命中」
+        # 必然压过「单路第一」——这正是 RRF 想要的语义，别为了「拉开差距」调小
+        k: 60
+        # 融合后交给重排的候选条数。**默认与 coarse-top-k 一致，是有意的**：
+        # 喂给重排的条数与加这一路之前完全一样，RRF 不带来额外开销。
+        # 调大它的话，重排模型那边的 topN 也要跟着调（装配处已经接上了 rrf.top-k）
+        top-k: 20
 
       # 上传大小上限（字节）。全局 multipart 的 10MB 是按手机照片定的，文本 1MB 足够
       max-file-size: 1048576

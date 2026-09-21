@@ -1,9 +1,5 @@
 package com.purify.purifyaiagent.agent;
 
-import com.purify.purifyaiagent.agent.loop.LoopType;
-
-import java.util.List;
-
 /**
  * 一次 run 的最终结果，阻塞式接口直接返回它。
  *
@@ -15,21 +11,17 @@ import java.util.List;
  *                 真正要展示给用户的是 {@code question}
  * @param question 需要用户回答的问题；不需要回答时为 null。展示它的优先级高于 {@code output}
  * @param steps    一共跑了几步。它是「这次花了多少代价」最直观的度量
- * @param loopHits 被看门狗拦下过几次。> 0 说明这次跑得不算顺，日志里有详细证据
- * @param loopTypes 命中的循环种类（去重，按首次命中的顺序）。
- *                  单独列出来是因为「被拦过 3 次」和「被拦的 3 次是同一种循环」是两种完全不同的病情
+ * @param loopHits 被看门狗拦下过几次。> 0 说明这次跑得不算顺，日志里有详细证据。
+ *                 至于「拦下的是不是同一种循环」，看日志（{@code LoopSignal#describe}）——
+ *                 这里曾经有一个 {@code loopTypes} 字段记着循环种类，但从加进来起
+ *                 就没有任何读取方，属于纯预留，已删
  */
 public record AgentResult(String chatId,
                           AgentState state,
                           String output,
                           String question,
                           int steps,
-                          int loopHits,
-                          List<LoopType> loopTypes) {
-
-    public AgentResult {
-        loopTypes = List.copyOf(loopTypes);
-    }
+                          int loopHits) {
 
     /** 调用方最常问的一句：这次是等用户说话，还是可以当作答复直接展示？ */
     public boolean waitingForUser() {

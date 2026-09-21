@@ -1,6 +1,8 @@
 package com.purify.purifyaiagent.auth;
 
 import com.purify.purifyaiagent.config.AuthProperties;
+import com.purify.purifyaiagent.i18n.MessageResolver;
+import com.purify.purifyaiagent.i18n.Messages;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.mail.SimpleMailMessage;
@@ -28,10 +30,14 @@ public class EmailSender {
 
     private final ObjectProvider<JavaMailSender> mailSenderProvider;
     private final AuthProperties authProperties;
+    private final MessageResolver messageResolver;
 
-    public EmailSender(ObjectProvider<JavaMailSender> mailSenderProvider, AuthProperties authProperties) {
+    public EmailSender(ObjectProvider<JavaMailSender> mailSenderProvider,
+                       AuthProperties authProperties,
+                       MessageResolver messageResolver) {
         this.mailSenderProvider = mailSenderProvider;
         this.authProperties = authProperties;
+        this.messageResolver = messageResolver;
     }
 
     /**
@@ -43,26 +49,42 @@ public class EmailSender {
      * 让他当场看到「发送失败，请稍后重试」比让他等要好。
      */
     public void sendVerificationCode(String email, String code, VerificationPurpose purpose) {
-        String subject = subjectOf(purpose);
-        String body = bodyOf(code, purpose);
 
-        JavaMailSender sender = authProperties.getMail().isEnabled() ? mailSenderProvider.getIfAvailable() : null;
+        // 清理前后空白，避免 "xxx@qq.com " 这种地址导致 SMTP 报错
+        email = email == null ? null : email.trim();
+
+        // 基础邮箱格式校验
+        if (!StringUtils.hasText(email) || !email.contains("@")) {
+            throw new IllegalArgumentException("邮箱地址格式不正确");
+        }
+
+        // 邮件是**给用户看的**，所以它也跟着语言走。语言在请求线程上取一次
+        // （发验证码是个同步接口），然后一路传到下面的拼装里
+        Messages i18n = messageResolver.current();
+        String subject = subjectOf(i18n, purpose);
+        String body = bodyOf(i18n, code, purpose);
+
+        JavaMailSender sender = authProperties.getMail().isEnabled()
+                ? mailSenderProvider.getIfAvailable()
+                : null;
+
         if (sender == null) {
-            // 这个 WARN 是**故意**打得这么显眼的：它带着验证码本身，
-            // 而这样一条日志出现在生产环境就意味着「没人收到验证码，但谁看日志谁能注册任何账号」
-            log.warn("[未发信] 邮件未启用，验证码只打在这里 → 邮箱={} 用途={} 验证码={}。"
-                            + "要真的发出去：在 application-local.yml 配好 spring.mail.*，"
-                            + "并把 purify.auth.mail.enabled 改成 true",
+            log.warn("[未发信] 邮件未启用，验证码只打在这里 → 邮箱={} 用途={} 验证码={}。",
                     email, purpose, code);
             return;
         }
+
+        log.info("[邮件] 准备发送验证码：from={}，to={}，用途={}",
+                fromAddress(sender), email, purpose);
 
         SimpleMailMessage message = new SimpleMailMessage();
         message.setFrom(fromAddress(sender));
         message.setTo(email);
         message.setSubject(subject);
         message.setText(body);
+
         sender.send(message);
+
         log.info("[邮件] 验证码已发送：邮箱={} 用途={}", email, purpose);
     }
 
@@ -86,10 +108,10 @@ public class EmailSender {
         return null;
     }
 
-    private static String subjectOf(VerificationPurpose purpose) {
-        return purpose == VerificationPurpose.REGISTER
-                ? "【Purify AI】注册验证码"
-                : "【Purify AI】找回密码验证码";
+    private static String subjectOf(Messages i18n, VerificationPurpose purpose) {
+        return i18n.get(purpose == VerificationPurpose.REGISTER
+                ? "auth.mail.subjectRegister"
+                : "auth.mail.subjectReset");
     }
 
     /**
@@ -99,15 +121,9 @@ public class EmailSender {
      * 验证码邮件是「看一眼就把邮件删掉」的东西，花哨的模板只会让它在
      * 垃圾邮件过滤器那里多挨几分，而这类邮件本来就最容易进垃圾箱。
      */
-    private static String bodyOf(String code, VerificationPurpose purpose) {
-        String action = purpose == VerificationPurpose.REGISTER ? "注册账号" : "重置密码";
-        return """
-                你正在%s，验证码是：
-
-                %s
-
-                验证码 10 分钟内有效，请勿转发给他人。
-                如果这不是你本人操作的，忽略这封邮件即可，你的账号不会有任何变化。
-                """.formatted(action, code);
+    private static String bodyOf(Messages i18n, String code, VerificationPurpose purpose) {
+        return i18n.get(purpose == VerificationPurpose.REGISTER
+                ? "auth.mail.bodyRegister"
+                : "auth.mail.bodyReset", code);
     }
 }

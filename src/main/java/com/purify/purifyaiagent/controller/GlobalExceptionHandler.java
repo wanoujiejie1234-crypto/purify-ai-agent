@@ -1,10 +1,15 @@
 package com.purify.purifyaiagent.controller;
 
+import com.purify.purifyaiagent.advisor.SensitiveWordChecker;
 import com.purify.purifyaiagent.exception.ApiException;
 import com.purify.purifyaiagent.exception.AuthException;
 import com.purify.purifyaiagent.exception.SensitiveWordException;
+import com.purify.purifyaiagent.exception.UpstreamException;
+import com.purify.purifyaiagent.i18n.MessageResolver;
+import com.purify.purifyaiagent.i18n.Messages;
 import com.purify.purifyaiagent.model.ErrorReply;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.i18n.LocaleContextHolder;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -15,10 +20,27 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
  * <p>敏感词拦截不是系统故障，而是业务上的「主动拒绝」，
  * 因此这里返回 HTTP 200 + 明确的错误码，让前端可以像普通消息一样渲染这段引导话术；
  * 真正的系统异常才走 500。
+ *
+ * <p><b>这里是异常文案唯一被翻成人类语言的地方。</b>异常对象里带的是键 + 参数
+ * （见 {@code ApiException} 的类注释），翻译发生在这一步，因为只有这里同时握着
+ * 两样东西：一个 {@code MessageSource}，和当前请求的语言
+ * （由 Spring Boot 默认的 {@code AcceptHeaderLocaleResolver} 从 {@code Accept-Language} 解析）。
+ *
+ * <p>这个方法一定跑在请求线程上（Spring MVC 的异常处理链），
+ * 所以 {@code MessageResolver#current()} 里的 {@code LocaleContextHolder} 是准的——
+ * 这一点和智能体循环里完全不同，那边必须靠 {@code AgentRun} 把语言带下去。
  */
 @Slf4j
 @RestControllerAdvice
 public class GlobalExceptionHandler {
+
+    private final MessageResolver messageResolver;
+    private final SensitiveWordChecker sensitiveWordChecker;
+
+    public GlobalExceptionHandler(MessageResolver messageResolver, SensitiveWordChecker sensitiveWordChecker) {
+        this.messageResolver = messageResolver;
+        this.sensitiveWordChecker = sensitiveWordChecker;
+    }
 
     /**
      * 命中敏感词：把 Advisor 抛出的异常翻译成用户可读的引导话术。
@@ -26,11 +48,27 @@ public class GlobalExceptionHandler {
      * <p><b>必须排在 {@link ApiException} 那条之前处理</b>——两者是兄弟类型，
      * {@code SensitiveWordException} 不继承 {@code ApiException}，就是为了防止
      * 这条 200 分支被下面那条 400 抢走。
+     *
+     * <p><b>这是同一条规则的第一处实现，不是唯一一处。</b>SSE 那几个接口拿不到
+     * {@code @RestControllerAdvice}——异常发生在流被订阅之后，早就出了 Spring MVC 的
+     * 异常处理链，所以 {@code SlimAppController#terminalEvent} 把同一个异常又翻了一遍，
+     * 翻成 {@code AgentEvent.blocked(...)}。
+     *
+     * <p>两者的输出形态注定不同（一个是 HTTP body，一个是 SSE 事件），没法合并，
+     * 能共享的只有「哪类异常算业务拒绝」这个判据。所以<b>新增一种业务拒绝型异常时，
+     * 两个地方都要改</b>，而漏掉流式那处不会有任何编译错误、测试失败或日志——
+     * 表现是流式用户看到一句「流式响应失败了」，与事实相反。
+     *
+     * @see SlimAppController#terminalEvent
      */
     @ExceptionHandler(SensitiveWordException.class)
     public ResponseEntity<ErrorReply> handleSensitiveWord(SensitiveWordException exception) {
         log.warn("请求被敏感词拦截：hitWord={}", exception.getHitWord());
-        return ResponseEntity.ok(new ErrorReply("SENSITIVE_WORD_BLOCKED", exception.getReplyMessage()));
+        // 话术在这里取，不在 Advisor 里取：异常是 Advisor 抛的，而那条链在流式用法下
+        // 跑在 Reactor 线程上，读 LocaleContextHolder 会静默回落成默认语言。
+        // 这个方法一定在请求线程上，取到的语言是准的。见 SensitiveWordException 的类注释
+        String reply = sensitiveWordChecker.replyMessage(LocaleContextHolder.getLocale());
+        return ResponseEntity.ok(new ErrorReply("SENSITIVE_WORD_BLOCKED", reply));
     }
 
     /**
@@ -56,10 +94,34 @@ public class GlobalExceptionHandler {
      */
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorReply> handleApiException(ApiException exception) {
+        String message = resolve(exception.getMessageKey(), exception.getArgs());
+        // 记的是**翻好之后**的那句话，不是键：日志是给人看的，
+        // 一句「用户名已经被占用了」比 error.auth.usernameTaken 好读，
+        // 而键本来就在异常抛出的那一行代码上，需要时顺藤摸瓜即可
         log.warn("请求未通过：status={} code={} message={}",
-                exception.getStatus().value(), exception.getCode(), exception.getMessage());
+                exception.getStatus().value(), exception.getCode(), message);
         return ResponseEntity.status(exception.getStatus())
-                .body(new ErrorReply(exception.getCode(), exception.getMessage()));
+                .body(new ErrorReply(exception.getCode(), message));
+    }
+
+    /**
+     * 上游服务（百炼）没把活干成：超时、限流、{@code Success=false}、5xx。
+     *
+     * <p><b>为什么单开一条分支而不是并进 {@link ApiException}</b>：那条的契约是 400
+     * 「你传错了」，而这里错在上游——用户改什么都没用，只能等或去申请权限。
+     * 状态码取自异常对象（见 {@link UpstreamException}），不是在这里写死 502。
+     *
+     * <p>记 WARN 而不是 ERROR：这是外部依赖的抖动，不是本系统的故障，
+     * 用 ERROR 会让真正该报警的条目淹在里面。但也不能像 {@code AuthException}
+     * 那样降到 DEBUG——「知识库同步时好时坏」正是最需要日志能回答的那类问题。
+     */
+    @ExceptionHandler(UpstreamException.class)
+    public ResponseEntity<ErrorReply> handleUpstreamException(UpstreamException exception) {
+        String message = resolve(exception.getMessageKey(), exception.getArgs());
+        log.warn("上游调用失败：status={} code={} message={}",
+                exception.getStatus().value(), exception.getCode(), message);
+        return ResponseEntity.status(exception.getStatus())
+                .body(new ErrorReply(exception.getCode(), message));
     }
 
     /**
@@ -83,8 +145,22 @@ public class GlobalExceptionHandler {
      */
     @ExceptionHandler(AuthException.class)
     public ResponseEntity<ErrorReply> handleAuthException(AuthException exception) {
-        log.debug("鉴权未通过：code={} message={}", exception.getCode(), exception.getMessage());
+        String message = resolve(exception.getMessageKey(), exception.getArgs());
+        log.debug("鉴权未通过：code={} message={}", exception.getCode(), message);
         return ResponseEntity.status(exception.getStatus())
-                .body(new ErrorReply(exception.getCode(), exception.getMessage()));
+                .body(new ErrorReply(exception.getCode(), message));
+    }
+
+    /**
+     * 把「键 + 参数」翻成当前请求语言下的一句话。
+     *
+     * <p>取自 request 的语言，不是 JVM 默认语言——{@code AcceptHeaderLocaleResolver}
+     * 已经把 {@code Accept-Language} 解析好放在 {@code LocaleContextHolder} 里了。
+     * 前端（{@code api/http.js} 和 {@code api/sse.js} 两处）每个请求都会带上这个头，
+     * 漏掉的表现是「界面全英文，一报错冒出一句中文」。
+     */
+    private String resolve(String key, Object[] args) {
+        Messages messages = messageResolver.current();
+        return messages.get(key, args);
     }
 }

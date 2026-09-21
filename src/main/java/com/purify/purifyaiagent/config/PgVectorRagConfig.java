@@ -10,6 +10,9 @@ import com.purify.purifyaiagent.rag.KnowledgeBaseAdvisor;
 import com.purify.purifyaiagent.rag.KnowledgeRouter;
 import com.purify.purifyaiagent.rag.RagPrompts;
 import com.purify.purifyaiagent.rag.pgvector.DashScopeEmbeddingBatchingStrategy;
+import com.purify.purifyaiagent.rag.pgvector.KeywordArmStatus;
+import com.purify.purifyaiagent.rag.pgvector.KeywordTermExtractor;
+import com.purify.purifyaiagent.rag.pgvector.PgKeywordSearcher;
 import com.purify.purifyaiagent.rag.pgvector.PgVectorDocumentRetriever;
 import com.purify.purifyaiagent.rag.pgvector.PgVectorIndexService;
 import com.purify.purifyaiagent.rag.pgvector.PgVectorKnowledgeBaseAdvisor;
@@ -171,10 +174,15 @@ public class PgVectorRagConfig {
      * <p>和 Embedding 一样，返回类型写具体类才能让自动配置里那个
      * {@code @ConditionalOnMissingBean} 的 {@code DashScopeRerankModel} 退避。
      *
-     * <p>{@code topN} 特意设成粗排条数而不是最终条数：重排接口的 topN 是「返回几条」，
+     * <p>{@code topN} 特意设成候选条数而不是最终条数：重排接口的 topN 是「返回几条」，
      * 如果一上来只让它返回 5 条，那 5 条里只要有 3 条没达到
      * {@code rerank-min-score}，结果就只剩 2 条——即使排第 6 的其实达标。
      * 让它把候选全还回来，过滤和截断都由我们自己按阈值做。
+     *
+     * <p><b>这个数必须是「喂给重排的候选数」而不是粗排的条数。</b>加了关键词那一路之后，
+     * 候选数由 {@code rrf-top-k} 决定（RRF 融合后的条数），而它<b>可以大于</b>
+     * {@code coarse-top-k}。继续用后者的话，重排接口只会返回 coarse-top-k 条，
+     * 多出来的候选被<b>静默截断</b>——RRF 那一半的工作无声无息地丢了。
      */
     @Bean
     @ConditionalOnProperty(prefix = "purify.rag", name = "enable-reranking", havingValue = "true",
@@ -184,7 +192,8 @@ public class PgVectorRagConfig {
         DashScopeRerankModel model = new DashScopeRerankModel(ragDashScopeApi,
                 DashScopeRerankOptions.builder()
                         .withModel(pgVectorProperties.getRerankModelName())
-                        .withTopN(pgVectorProperties.getCoarseTopK())
+                        // 用 rrf-top-k 而不是 coarse-top-k：见上面那段注释
+                        .withTopN(pgVectorProperties.getRrf().getTopK())
                         // 不需要接口把原文回传：重排结果里的 Document 是按序号
                         // 从我们传进去的候选里回查的，元数据不会丢
                         .withReturnDocuments(false)
@@ -221,15 +230,63 @@ public class PgVectorRagConfig {
                 .build();
     }
 
-    /** 检索器：分类过滤 + 向量粗排 + Rank 模型精排。 */
+    /**
+     * 关键词检索那一路的拆词器。纯函数、无依赖。
+     */
     @Bean
-    public DocumentRetriever pgVectorDocumentRetriever(VectorStore pgVectorStore,
-                                                       RagProperties ragProperties,
-                                                       PgVectorProperties pgVectorProperties,
-                                                       ObjectProvider<RerankModel> ragRerankModel) {
+    public KeywordTermExtractor keywordTermExtractor(PgVectorProperties pgVectorProperties) {
+        return new KeywordTermExtractor(pgVectorProperties.getKeyword());
+    }
+
+    /**
+     * 关键词检索那一路。
+     *
+     * <p><b>这里必须显式接 {@link PgVectorJdbc} 再取它的 {@code jdbcTemplate()}，
+     * 绝不能按类型注入 {@code JdbcTemplate}。</b>本类的类注释里那条「铁律」讲得很清楚：
+     * 容器里那个 {@code JdbcTemplate} 连的是对话记忆的 MySQL，按类型注入拿到的一定是它。
+     * 现有两处（{@code pgVectorStore}、{@code pgVectorIndexService}）也是这么做的。
+     *
+     * <p>它<b>刻意不实现</b> {@code DocumentRetriever}：那会让
+     * {@code RagCommonConfig.knowledgeSearch} 的按类型注入撞上两个候选。
+     * 详见 {@link PgKeywordSearcher} 的类注释。
+     */
+    @Bean
+    public PgKeywordSearcher pgKeywordSearcher(PgVectorJdbc pgVectorJdbc,
+                                               PgVectorProperties pgVectorProperties,
+                                               KeywordTermExtractor keywordTermExtractor) {
+        return new PgKeywordSearcher(pgVectorJdbc.jdbcTemplate(), pgVectorProperties, keywordTermExtractor);
+    }
+
+    /**
+     * 关键词那一路的工作状态，单独做成 Bean 是为了让体检日志和自检接口都能读到它，
+     * 而不必去碰检索器本身。
+     *
+     * <p>它是个 record、探测结果在内部记忆化，所以这个 Bean 是单例、只探一次。
+     */
+    @Bean
+    public KeywordArmStatus keywordArmStatus(PgKeywordSearcher pgKeywordSearcher) {
+        return pgKeywordSearcher.status();
+    }
+
+    /**
+     * 检索器：分类过滤 + 向量粗排 + 关键词检索 + RRF 融合 + Rank 模型精排。
+     *
+     * <p>关键词那一路用 {@code ObjectProvider} 取：没装配时整条链路退化成纯向量检索，
+     * 与加这一路之前完全一致。这是本链路唯一安全的降级方式。
+     *
+     * <p><b>Bean 名与百炼链路那个刻意一致</b>（{@code knowledgeBaseDocumentRetriever}），
+     * 理由同下面的 {@link #knowledgeBaseRetrievalAdvisor}。
+     */
+    @Bean
+    public DocumentRetriever knowledgeBaseDocumentRetriever(VectorStore pgVectorStore,
+                                                            RagProperties ragProperties,
+                                                            PgVectorProperties pgVectorProperties,
+                                                            ObjectProvider<RerankModel> ragRerankModel,
+                                                            ObjectProvider<PgKeywordSearcher> keywordSearcher) {
         return new PgVectorDocumentRetriever(pgVectorStore, ragProperties, pgVectorProperties,
                 // 关掉 enable-reranking 时容器里没有这个 Bean，检索退化成只做向量粗排
-                ragRerankModel.getIfAvailable());
+                ragRerankModel.getIfAvailable(),
+                keywordSearcher.getIfAvailable());
     }
 
     /**
@@ -241,7 +298,7 @@ public class PgVectorRagConfig {
      * 也就不会撞上 {@code NoUniqueBeanDefinitionException}。
      */
     @Bean
-    public KnowledgeBaseAdvisor knowledgeBaseRetrievalAdvisor(DocumentRetriever pgVectorDocumentRetriever,
+    public KnowledgeBaseAdvisor knowledgeBaseRetrievalAdvisor(DocumentRetriever knowledgeBaseDocumentRetriever,
                                                              RagProperties ragProperties,
                                                              KnowledgeRouter knowledgeRouter) {
         if (ragProperties.isEnableReference()) {
@@ -252,7 +309,7 @@ public class PgVectorRagConfig {
                     + "需要引用标注请把 purify.rag.store 改成 bailian");
         }
 
-        return new PgVectorKnowledgeBaseAdvisor(pgVectorDocumentRetriever,
+        return new PgVectorKnowledgeBaseAdvisor(knowledgeBaseDocumentRetriever,
                 RagPrompts.USER_TEXT_ADVISE,
                 ragProperties.getOrder(),
                 knowledgeRouter,
