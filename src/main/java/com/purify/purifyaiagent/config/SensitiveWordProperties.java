@@ -24,6 +24,15 @@ public class SensitiveWordProperties {
     /** 命中任意一个词即拦截。 */
     private List<String> words = new ArrayList<>();
 
-    /** 拦截后返回给用户的引导话术。 */
+    /** 拦截后返回给用户的引导话术（中文，也是英文没配时的兜底）。 */
     private String replyMessage = "这个话题我没办法帮你，建议咨询专业医生。";
+
+    /**
+     * 英文的引导话术。留空表示沿用 {@link #replyMessage}。
+     *
+     * <p>为什么不放进 {@code messages*.properties}：它是**产品策略**的一部分，
+     * 和上面那份词表配套（改了词、往往也要改话术）。放进资源包的话，改一句话术
+     * 就得找到对应的那个键名，而这个词表本身又是配置项——两个地方管一件事更容易漏。
+     */
+    private String replyMessageEn = "";
 }

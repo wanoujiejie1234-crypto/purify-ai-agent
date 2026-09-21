@@ -1,6 +1,7 @@
 package com.purify.purifyaiagent.rag;
 
 import com.purify.purifyaiagent.agent.AgentEvent;
+import com.purify.purifyaiagent.i18n.Messages;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.rag.Query;
@@ -155,22 +156,32 @@ public final class KnowledgeSearch {
          *
          * <p>只放条数和文档名，不放切片原文：SSE 是逐条推送的，把原文塞进来会把流刷爆，
          * 而用户在对话界面上本来也不需要读原文——要原文有日志和 {@code /api/rag/search}。
+         *
+         * <p>收 {@link Messages} 而不是自己去取语言：调用方是 {@code PurifyManus}，
+         * 而它跑在 Reactor 线程上（见 {@code AgentRun#i18n()}）。
+         * 这里也没法用 {@code LocaleContextHolder}——那会静默回落成默认语言。
          */
-        public String summary() {
+        public String summary(Messages messages) {
             if (!decision.retrieve()) {
-                return "知识库检索：与知识库无关，未发起检索";
+                return messages.get("agent.retrievalOffTopic");
             }
             if (documents.isEmpty()) {
-                return "知识库检索「%s」：命中 0 条".formatted(question());
+                return messages.get("agent.retrievalNoHits", question());
             }
             String sources = documents.stream()
                     .map(document -> document.getMetadata().get("doc_name"))
                     .filter(Objects::nonNull)
                     .map(String::valueOf)
                     .distinct()
-                    .collect(Collectors.joining("、"));
-            return "知识库检索「%s」：命中 %d 条（%s）· 耗时 %dms"
-                    .formatted(question(), documents.size(), sources, elapsedMs);
+                    // 分隔符也跟着语言走。写死「、」的话，英文界面上会出现
+                    // 「a、b、c」这种一眼假的排版
+                    .collect(Collectors.joining(isChinese(messages) ? "、" : ", "));
+            return messages.get("agent.retrievalHits",
+                    question(), documents.size(), sources, elapsedMs);
+        }
+
+        private static boolean isChinese(Messages messages) {
+            return messages.locale().getLanguage().startsWith("zh");
         }
     }
 

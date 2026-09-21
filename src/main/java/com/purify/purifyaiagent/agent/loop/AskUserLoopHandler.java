@@ -32,16 +32,16 @@ public class AskUserLoopHandler implements LoopHandler {
     public LoopAction handle(LoopSignal signal, AgentRun run) {
         // 把「跑到第几步」「最近在做什么」一并说清楚：用户看到的不是一句抽象的报错，
         // 而是「它试了什么、卡在哪、我需要补什么」，这比让他去翻日志有用得多
+        // 三段文案都走 run 上那份 Messages（这里跑在 Reactor 线程上，读不到请求语言）。
+        // 拆成三段而不是塞进一个带可选参数的模板：中间那句「我最近一次的想法是」
+        // 只在有内容时才出现，挤进同一个模板就得靠条件表达式凑参数，更难读
         String lastWords = run.lastAssistantText();
-        StringBuilder question = new StringBuilder()
-                .append("我在这个任务上连续 ").append(signal.streak())
-                .append(" 次重复了同样的操作（").append(signal.evidence()).append("），换个说法也没能推进。")
-                .append("\n需要你补充一点信息，我才能换个方向继续。");
+        StringBuilder question = new StringBuilder(
+                run.i18n().get("agent.askUser", signal.streak(), signal.evidence()));
         if (!lastWords.isBlank()) {
-            question.append("\n我最近一次的想法是：").append(abbreviate(lastWords));
+            question.append(run.i18n().get("agent.askUserLastWords", abbreviate(lastWords)));
         }
-        question.append("\n你可以直接告诉我：这个任务的目标是什么、有没有必须遵守的条件，"
-                + "或者你更希望我先做哪一步。");
+        question.append(run.i18n().get("agent.askUserTail"));
         return LoopAction.askUser(question.toString());
     }
 

@@ -1,5 +1,6 @@
 import axios from 'axios'
 import * as auth from '../auth.js'
+import { t, acceptLanguageHeader } from '../i18n/index.js'
 
 /**
  * 普通 JSON 请求走 axios。
@@ -31,6 +32,10 @@ http.interceptors.request.use((config) => {
   if (current) {
     config.headers.Authorization = `Bearer ${current}`
   }
+  // 告诉后端用哪种语言写报错文案（后端 `messages*.properties` 靠它选）。
+  // 和令牌一样必须「一个不漏」：漏掉的接口会在中文界面上返回英文报错，
+  // 或者反过来——用户在设置里切了英文，某个接口却仍然报中文。
+  config.headers['Accept-Language'] = acceptLanguageHeader()
   return config
 })
 
@@ -86,28 +91,29 @@ http.interceptors.response.use(
     // 这里**不做区分**：对用户来说两者的动作都是重新登录
     if (status === 401) {
       redirectToLogin()
-      return Promise.reject(new Error(serverMessage || '登录已失效，请重新登录。'))
+      return Promise.reject(new Error(serverMessage || t('error.unauthorized')))
     }
 
     // 403：身份是好的，只是权限不够。**绝对不能跳登录页、更不能清令牌**——
     // 那样普通用户点到一个本不该看到的链接就被登出了，而实际上什么都没发生。
     // 保持登录，把后端那句话原样抛出去，让调用方弹个提示就行
     if (status === 403) {
-      return Promise.reject(new Error(serverMessage || '这个功能只对超级管理员开放。'))
+      return Promise.reject(new Error(serverMessage || t('error.forbidden')))
     }
 
+    // 后端说了话就用它那句——它已经按 Accept-Language 翻好了，而且比前端这句更具体
     if (serverMessage) return Promise.reject(failure(serverMessage, serverCode, status))
 
     if (err?.code === 'ECONNABORTED') {
-      return Promise.reject(failure('请求超时，请稍后重试。'))
+      return Promise.reject(failure(t('error.timeout')))
     }
     if (!err?.response) {
-      return Promise.reject(failure('连不上后端服务（http://localhost:8080），请确认 Spring Boot 已经启动。'))
+      return Promise.reject(failure(t('error.offline')))
     }
     if (status === 404) {
-      return Promise.reject(failure('请求的资源不存在（404）。', undefined, 404))
+      return Promise.reject(failure(t('error.notFound'), undefined, 404))
     }
-    return Promise.reject(failure(`请求失败（HTTP ${status}）`, undefined, status))
+    return Promise.reject(failure(t('error.http', { status }), undefined, status))
   },
 )
 
@@ -162,6 +168,77 @@ export async function renameSession(conversationId, title) {
 
 export async function deleteSession(conversationId) {
   await http.delete(`/api/sessions/${encodeURIComponent(conversationId)}`)
+}
+
+/* -------------------------------------------------------------------- 画像 */
+
+/**
+ * 读当前用户的画像。
+ *
+ * 响应里除了画像本身还带着活动水平的可选项（`activityLevelOptions`）——
+ * 下拉框的选项由后端给，前端不写死一份：写死的话，以后枚举改了名或加了档，
+ * 表现是「某个选项保存不了」，而那种问题很难联想到是前端少更新了一个数组。
+ */
+export async function fetchProfile() {
+  const { data } = await http.get('/api/profile')
+  return data
+}
+
+/**
+ * 改画像。**只传这次改动的字段**，没传的后端保持原值。
+ *
+ * 返回改完之后完整的画像，直接拿它刷新表单即可，不用再 fetchProfile 一次。
+ */
+export async function updateProfile(payload) {
+  const { data } = await http.put('/api/profile', payload)
+  return data
+}
+
+/* ------------------------------------------------------------------ 资料库 */
+
+/**
+ * 当前用户在对话里产出的文件，最近的在前。
+ *
+ * 每条带着 `url`（能直接打开的地址，可能为 null）和 `kind`：
+ * - `url` 有值：生成的 PDF、下载回来的资源。界面用普通链接即可，那个地址本身是公开的；
+ * - `url` 为 null：writeFile 写出来的文件。它落在服务端一个**没有对外映射**的目录里，
+ *   只能走 `downloadResourceFile` 那个带鉴权的接口。
+ */
+export async function fetchResources(limit = 50) {
+  const { data } = await http.get('/api/resources', { params: { limit } })
+  return Array.isArray(data) ? data : []
+}
+
+export async function deleteResource(id) {
+  await http.delete(`/api/resources/${encodeURIComponent(id)}`)
+}
+
+/**
+ * 下载一份「没有对外地址」的产出（就是 writeFile 写出来的那些）。
+ *
+ * **不能用 `<a href="/api/resources/{id}/download">`。** 那是一次浏览器导航，
+ * 不带 Authorization 头，而接口是要求登录的——点下去只会得到一个 401。
+ * 所以这里用 axios 把文件取成 blob（请求拦截器会带上令牌），
+ * 再用一个临时链接触发保存。
+ *
+ * 代价是整个文件会先进内存。资料库里的东西都是文本或小文件，这点开销可以接受；
+ * 真出现几十 MB 的产出时，要改成后端签发一次性下载令牌，而不是继续往内存里灌。
+ */
+export async function downloadResourceFile(id, title) {
+  const { data } = await http.get(`/api/resources/${encodeURIComponent(id)}/download`, {
+    responseType: 'blob',
+  })
+  const objectUrl = URL.createObjectURL(data)
+  const anchor = document.createElement('a')
+  anchor.href = objectUrl
+  // 文件名由后端在 Content-Disposition 里给了，但 blob 这条路上浏览器读不到它
+  // （那个头要 exposedHeaders 才允许 JS 读），所以这里再带一次
+  anchor.download = title || ''
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  // 立刻回收：不释放的话这块内存在页面关掉之前一直占着
+  URL.revokeObjectURL(objectUrl)
 }
 
 /* ------------------------------------------------------------------ 知识库 */

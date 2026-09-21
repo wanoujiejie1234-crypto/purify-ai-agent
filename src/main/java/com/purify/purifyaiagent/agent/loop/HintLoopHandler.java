@@ -30,17 +30,11 @@ public class HintLoopHandler implements LoopHandler {
 
     @Override
     public LoopAction handle(LoopSignal signal, AgentRun run) {
-        return LoopAction.hint("""
-
-                ## 重要提醒（系统检测到你在原地打转）
-                你刚才连续 %d 步做了同一件事：%s。
-                重复同样的操作不会得到不同的结果。请立刻换一个思路，具体来说：
-                - 换参数或换工具：目标没达成，多半是上一步的做法本身不对；
-                - 换个角度拆任务：把一步做不完的事拆成几步能做的小事；
-                - 如果缺的是只有用户才知道的信息（偏好、约束、目标），用 askHuman 直接问他，
-                  不要靠猜、也不要再试一遍。
-                下一步必须是和前面不同的做法。
-                """.formatted(signal.streak(), signal.evidence()));
+        // 文案走 run 上那份 Messages，**不读 LocaleContextHolder**：
+        // 这个处理器跑在 Reactor 的调度线程上，那里读不到请求的语言，
+        // 只会静默地回落成默认语言。要说的话在 messages*.properties 的 agent.hint
+        // （开头那个空行也在那边，它是要接在系统提示词后面的分隔）
+        return LoopAction.hint(run.i18n().get("agent.hint", signal.streak(), signal.evidence()));
     }
 
     @Override

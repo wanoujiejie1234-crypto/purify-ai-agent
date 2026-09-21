@@ -77,7 +77,7 @@ public class SessionController {
                                        @RequestParam String title,
                                        @CurrentUser LoginUser me) {
         if (!StringUtils.hasText(title)) {
-            throw ApiException.invalidChatRequest("标题不能为空");
+            throw ApiException.invalidChatRequest("error.session.titleRequired");
         }
         boolean renamed = chatSessionRepository.rename(conversationId, me.id(), title);
         if (!renamed) {
@@ -106,8 +106,7 @@ public class SessionController {
         if (parsed == null) {
             // 明确报错而不是退到默认入口：一个拼错的 link 如果静默变成「这个入口没有历史」，
             // 前端看到的只是一个空列表，没有任何线索指向「入口名写错了」
-            throw ApiException.invalidChatRequest(
-                    "未知的入口「" + entry + "」，只支持 " + ChatEntry.SLIM.link() + " 或 " + ChatEntry.MANUS.link());
+            throw ApiException.invalidChatRequest("error.session.unknownEntry", entry, ChatEntry.SLIM.link(), ChatEntry.MANUS.link());
         }
         return parsed;
     }

@@ -107,7 +107,7 @@ public class JwtService {
 
             String subject = claims.getSubject();
             if (!StringUtils.hasText(subject)) {
-                throw AuthException.unauthorized("登录已失效，请重新登录");
+                throw AuthException.unauthorized("error.auth.sessionExpired");
             }
             // role 认不出来时 UserRole.parse 退回 NORMAL（不是 SUPER），
             // 这个方向是安全的：坏数据只会让人权限变小，不会变大
@@ -118,7 +118,7 @@ public class JwtService {
             // 只记 debug：未登录时前端必然会打一堆无令牌的请求，而这些不是故障。
             // 记成 warn 会把真正的告警淹掉
             log.debug("[Jwt] 令牌校验不通过：{}", exception.getMessage());
-            throw AuthException.unauthorized("登录已失效，请重新登录");
+            throw AuthException.unauthorized("error.auth.sessionExpired");
         }
     }
 

@@ -62,6 +62,9 @@ spring:
         # 用户与邮箱验证码。脚本里还有一段注释掉的老数据清理 SQL，
         # 以及「为什么 role 列和两个唯一索引要交给 SchemaGuard 补」的说明
         - classpath:db/auth-schema-mysql.sql
+        # 资料库：智能体产出的文件和链接。为什么不去正则扫 chat_record.answer，
+        # 而是单建一张表并让工具在产出时自己记一笔，写在脚本注释里
+        - classpath:db/user-resource-schema-mysql.sql
 
   ai:
     # ---------------- 对话记忆：官方 JdbcChatMemoryRepository ----------------
@@ -168,6 +171,10 @@ purify:
       - 泻药
       - 绝食
     reply-message: "你提到的情况已经超出我作为健康顾问能处理的范围了。比起体重，你的身心健康更重要，建议尽快联系专业医生或心理咨询师聊一聊。全国心理援助热线：12356。"
+    # 英文界面用的话术。**这条不是可选的美化**：它是命中的那一刻用户唯一看到的
+    # 东西，留空会退回中文那份，英文用户会突然收到一大段看不懂的字。
+    # 两个国家的心理援助热线不一样，所以英文那份写的是国际通用的说法，没写号码。
+    reply-message-en: "What you're describing is beyond what I can help with as a health advisor. Your wellbeing matters more than your weight — please talk to a doctor or a counsellor soon. If you're in crisis, your local emergency number or a crisis line can help right away."
 
   # ---------------- 应用自身的对外地址 ----------------
   # 下载工具要把本地文件变成一个用户点得开的链接，而它不在 HTTP 请求上下文里，
@@ -182,6 +189,9 @@ purify:
     location: classpath:prompts/
     # slim-app-system.st 里 {nickname} 的取值
     nickname: 朋友
+    # 英文模板（*-en.st）里的取值。留空会退回上面那个中文的，
+    # 那样英文用户会在系统提示词里被叫「朋友」——模型多半会照着用
+    nickname-en: there
 
   # ---------------- PurifyManus：自己驱动循环的 ReAct 智能体 ----------------
   # 和上面的 slim 应用并列的一条链路（/api/manus/*），互不影响：

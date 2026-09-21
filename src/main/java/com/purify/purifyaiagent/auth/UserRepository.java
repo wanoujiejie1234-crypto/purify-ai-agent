@@ -167,6 +167,22 @@ public class UserRepository {
     }
 
     /**
+     * 换头像。
+     *
+     * <p>{@code avatar} 列一直就在表里（{@code auth-schema-mysql.sql} 建表时带的），
+     * 只是到今天为止从来没有人写过它——所以这个方法是这条链路上唯一的新增，
+     * 不需要任何 DDL 变更。
+     *
+     * <p>返回影响行数，调用方可以据此判断「这个用户还在不在」。
+     */
+    public int updateAvatar(Long userId, String avatarUrl) {
+        int updated = jdbcTemplate.update(
+                "UPDATE `user` SET avatar = ? WHERE id = ?", avatarUrl, userId);
+        log.info("[User] 已更新头像：userId={} 影响 {} 行", userId, updated);
+        return updated;
+    }
+
+    /**
      * 记录这次登录的时间和来源 IP。
      *
      * <p>失败只记日志不上抛：这两个字段是审计信息，不是登录的必要条件。

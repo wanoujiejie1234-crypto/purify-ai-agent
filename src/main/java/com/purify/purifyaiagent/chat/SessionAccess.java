@@ -39,8 +39,14 @@ import java.util.Optional;
 @Slf4j
 public final class SessionAccess {
 
-    /** 归属不符或不存在的统一说辞。两处引用同一个常量，免得有人只改了一边。 */
-    private static final String NOT_FOUND_MESSAGE = "会话不存在或已被删除";
+    /**
+     * 归属不符或不存在的统一说辞。三处引用同一个常量，免得有人只改了一边。
+     *
+     * <p>存的是 {@code messages*.properties} 里的**键**：两种语言下各有一句话，
+     * 但只要前端始终带着 {@code Accept-Language}，同一个请求里的两次响应就一定是
+     * 同一种语言，仍然分辨不出「不存在」和「不是你的」——这正是这里要的性质。
+     */
+    private static final String NOT_FOUND_KEY = "error.session.notFound";
 
     private SessionAccess() {
     }
@@ -65,7 +71,7 @@ public final class SessionAccess {
         if (!owner.get().equals(userId)) {
             log.warn("[会话] 拒绝写入不属于自己的会话：conversationId={} 归属={} 请求方={}",
                     conversationId, owner.get(), userId);
-            throw ApiException.notFound(NOT_FOUND_MESSAGE);
+            throw ApiException.notFound(NOT_FOUND_KEY);
         }
     }
 
@@ -82,12 +88,12 @@ public final class SessionAccess {
         Optional<String> owner = repository.ownerOf(conversationId);
         if (owner.isEmpty()) {
             log.debug("[会话] 读取了一个不存在的会话的历史：conversationId={}", conversationId);
-            throw ApiException.notFound(NOT_FOUND_MESSAGE);
+            throw ApiException.notFound(NOT_FOUND_KEY);
         }
         if (!owner.get().equals(userId)) {
             log.warn("[会话] 拒绝读取不属于自己的会话：conversationId={} 归属={} 请求方={}",
                     conversationId, owner.get(), userId);
-            throw ApiException.notFound(NOT_FOUND_MESSAGE);
+            throw ApiException.notFound(NOT_FOUND_KEY);
         }
     }
 }

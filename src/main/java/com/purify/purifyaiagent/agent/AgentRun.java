@@ -3,6 +3,7 @@ package com.purify.purifyaiagent.agent;
 import com.purify.purifyaiagent.agent.loop.LoopSignal;
 import com.purify.purifyaiagent.agent.loop.LoopType;
 import com.purify.purifyaiagent.agent.tool.HumanInterrupt;
+import com.purify.purifyaiagent.i18n.Messages;
 import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.UserMessage;
 
@@ -40,6 +41,20 @@ public final class AgentRun {
      */
     private final String userId;
 
+    /**
+     * 这次 run 该用哪种语言讲话，已经绑好。
+     *
+     * <p><b>为什么必须跟着 run 走，而不是在用到的地方现取</b>：run 的事件流跑在 Reactor 的
+     * 调度线程上（见 {@code BaseAgent#runStream} 的 {@code subscribeOn}），请求线程上的
+     * {@code LocaleContextHolder} 在那里不可见。现取不会报错，只会静默地回落成
+     * JVM 默认语言——表现是「英文界面上，智能体跑到一半冒出几句中文」。
+     * 这和 {@link #userId} 是同一个坑，所以处理方式也一样：请求线程上取一次，往下带。
+     *
+     * <p>放的是 {@link Messages} 而不是 {@code Locale}：拿到它的人不用再去找
+     * {@code MessageSource}，也就没有「又要注入一个 Bean、又只能在请求线程上取」的机会。
+     */
+    private final Messages i18n;
+
     private final List<Message> messages;
     private final List<AgentStep> steps = new ArrayList<>();
     private final List<String> hints = new ArrayList<>();
@@ -64,9 +79,10 @@ public final class AgentRun {
     private int loopHits = 0;
     private boolean streaming = false;
 
-    private AgentRun(String chatId, String userId, List<Message> history, String input) {
+    private AgentRun(String chatId, String userId, Messages i18n, List<Message> history, String input) {
         this.chatId = chatId;
         this.userId = userId;
+        this.i18n = i18n;
         this.messages = new ArrayList<>(history);
         // 用户这句话先落进工作列表：万一下一步就崩了，记忆里也还留着这次提问
         this.messages.add(new UserMessage(input));
@@ -80,9 +96,12 @@ public final class AgentRun {
      *                但 HTTP 入口在鉴权那一步就已经挡住了这种情况
      * @param history 这个会话已有的消息（来自 {@code AgentMemory}），会被拷进工作列表；
      *                外面那份不受影响——run 跑到一半失败时，记忆里保留的还是上一次完整的状态
+     * @param i18n    这次 run 该用哪种语言。**必须在请求线程上取好再传进来**，
+     *                理由见 {@link #i18n} 字段的说明
      */
-    public static AgentRun start(String chatId, String userId, String input, List<Message> history) {
-        return new AgentRun(chatId, userId, history, input);
+    public static AgentRun start(String chatId, String userId, Messages i18n,
+                                 String input, List<Message> history) {
+        return new AgentRun(chatId, userId, i18n, history, input);
     }
 
     public String chatId() {
@@ -98,6 +117,16 @@ public final class AgentRun {
      */
     public String userId() {
         return userId;
+    }
+
+    /**
+     * 这次 run 的文案出口，已经绑好语言。
+     *
+     * <p>凡是产出**给用户看的文案**的地方（看门狗话术、步数预算说明、模型调用失败的兜底），
+     * 都从这里取，不要在那些地方读 {@code LocaleContextHolder}——理由见 {@link #i18n}。
+     */
+    public Messages i18n() {
+        return i18n;
     }
 
     /** 正在拼装的工作消息列表（不含系统提示词）。每一步结束后由 {@code BaseAgent} 交给记忆保存。 */

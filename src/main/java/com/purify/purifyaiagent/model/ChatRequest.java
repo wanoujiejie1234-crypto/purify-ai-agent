@@ -26,7 +26,7 @@ public record ChatRequest(String chatId, String message) {
      */
     public String requireMessage() {
         if (message == null || message.isBlank()) {
-            throw ApiException.invalidChatRequest("message 不能为空");
+            throw ApiException.invalidChatRequest("error.chat.messageRequired");
         }
         return message;
     }

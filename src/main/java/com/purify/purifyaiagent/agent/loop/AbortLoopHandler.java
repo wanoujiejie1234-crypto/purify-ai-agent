@@ -25,11 +25,10 @@ public class AbortLoopHandler implements LoopHandler {
 
     @Override
     public LoopAction handle(LoopSignal signal, AgentRun run) {
-        return LoopAction.abort("这个任务我没能做完：连续 " + signal.streak() + " 步都在重复同样的操作（"
-                + signal.evidence() + "），再试下去大概率还是同样的结果，我先停在这里，不继续消耗了。"
-                + "\n已经跑过的 " + run.stepCount() + " 步都在这个会话里，你可以："
-                + "\n- 换一种说法把目标讲得更具体一点，我接着试；"
-                + "\n- 或者把任务拆小，先让我做其中一步。");
+        // 文案走 run 上那份 Messages，**不读 LocaleContextHolder**：这里跑在 Reactor 的
+        // 调度线程上，读不到请求语言。三个占位符依次是「连续步数」「判据给的证据」「已跑步数」
+        return LoopAction.abort(run.i18n().get(
+                "agent.abort", signal.streak(), signal.evidence(), run.stepCount()));
     }
 
     @Override

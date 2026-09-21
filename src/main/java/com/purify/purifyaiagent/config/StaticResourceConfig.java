@@ -30,19 +30,33 @@ public class StaticResourceConfig implements WebMvcConfigurer {
     /** 对外的访问前缀，要和 {@code ResourceDownloadTool} 拼出来的地址一致。 */
     private static final String DOWNLOAD_URL_PATTERN = "/files/download/**";
 
+    /**
+     * 头像的访问前缀，要和 {@code AvatarStorage.URL_PREFIX} 一致。
+     *
+     * <p>它和下载目录是<b>两个分开的映射</b>，而不是把头像也放进下载目录：
+     * 那个目录是「工具抓回来的东西」，会被清理；头像不该跟着一起消失。
+     */
+    private static final String AVATAR_URL_PATTERN = "/files/avatar/**";
+
     @Override
     public void addResourceHandlers(ResourceHandlerRegistry registry) {
+        mapDirectory(registry, DOWNLOAD_URL_PATTERN, FileConstant.DOWNLOAD_DIR, "下载工具的链接指向这里");
+        mapDirectory(registry, AVATAR_URL_PATTERN, FileConstant.AVATAR_DIR, "用户头像指向这里");
+    }
+
+    /** 把一个本地目录挂到一个 URL 前缀上，两个映射的写法保持一致。 */
+    private static void mapDirectory(ResourceHandlerRegistry registry, String pattern,
+                                     String directory, String note) {
         // 用 toUri() 而不是拼 "file:" + 路径：Windows 上路径分隔符是反斜杠，
         // 直接拼出来的是 file:D:\...\download，Spring 解析不了。
         // 目录还不存在时 toUri() 不带结尾斜杠，而资源位置少了它就匹配不到子路径，所以补上
-        String location = Paths.get(FileConstant.DOWNLOAD_DIR).toAbsolutePath().normalize().toUri().toString();
+        String location = Paths.get(directory).toAbsolutePath().normalize().toUri().toString();
         if (!location.endsWith("/")) {
             location = location + "/";
         }
-
-        registry.addResourceHandler(DOWNLOAD_URL_PATTERN).addResourceLocations(location);
-        log.info("[StaticResourceConfig] 已把 {} 映射到 {}（下载工具的链接指向这里）",
-                DOWNLOAD_URL_PATTERN, Path.of(FileConstant.DOWNLOAD_DIR).toAbsolutePath());
+        registry.addResourceHandler(pattern).addResourceLocations(location);
+        log.info("[StaticResourceConfig] 已把 {} 映射到 {}（{}）",
+                pattern, Path.of(directory).toAbsolutePath(), note);
     }
 
     /**

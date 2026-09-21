@@ -76,13 +76,32 @@ const PURIFY_CONFIG = {
 }
 
 /**
+ * 把「整个代码段就是一个裸 URL」的写法拆回纯文本。
+ *
+ * 模型经常把下载链接写成 `https://…`（用反引号包起来），大概是把 URL 当成「技术性内容」
+ * 处理了。但反引号在 markdown 里是行内代码：渲染出来是 <code>，等宽字体加底灰，
+ * 看着像一段代码，而且**点不动**——用户看到的现象就是「链接没有给出来」。
+ *
+ * 提示词里已经明确要求过不要包反引号（见 purify-manus-system.st 的「链接怎么给」），
+ * 但提示词是软的。这一层是兜底，和本文件顶上那两道 XSS 防线同一个思路：
+ * 能挡住的地方先挡，挡不住的地方留一层兜底。
+ *
+ * 只在「单反引号、且内容整体就是一个 http(s) 地址」时才拆，误伤面很小：
+ * 真要展示一段 URL 代码的人会写成三反引号的代码块——那种形式的反引号前面是换行，
+ * 匹配不上这条规则。
+ */
+function unwrapUrlCodeSpans(text) {
+  return text.replace(/`(https?:\/\/[^\s`<>]+)`/g, '$1')
+}
+
+/**
  * 渲染成可以直接放进 v-html 的 HTML 字符串。
  *
  * @param {string} text 模型的原始输出（markdown 源码）
  */
 export function renderMarkdown(text) {
   if (!text) return ''
-  return DOMPurify.sanitize(md.render(text), PURIFY_CONFIG)
+  return DOMPurify.sanitize(md.render(unwrapUrlCodeSpans(text)), PURIFY_CONFIG)
 }
 
 /**

@@ -4,15 +4,16 @@ import com.alibaba.cloud.ai.dashscope.chat.DashScopeChatOptions;
 import com.purify.purifyaiagent.advisor.LoggingAdvisor;
 import com.purify.purifyaiagent.advisor.ReReadingAdvisor;
 import com.purify.purifyaiagent.advisor.SensitiveWordAdvisor;
+import com.purify.purifyaiagent.agent.tool.ToolContexts;
 import com.purify.purifyaiagent.chat.ChatRecordRepository;
 import com.purify.purifyaiagent.chat.ChatScene;
 import com.purify.purifyaiagent.config.PromptProperties;
+import com.purify.purifyaiagent.i18n.Messages;
 import com.purify.purifyaiagent.config.RagProperties;
 import com.purify.purifyaiagent.config.VisionProperties;
 import com.purify.purifyaiagent.model.ChatRecord;
 import com.purify.purifyaiagent.prompt.PromptTemplateLoader;
 import com.purify.purifyaiagent.rag.KnowledgeBaseAdvisor;
-import com.purify.purifyaiagent.tools.UserProfileTool;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
@@ -105,8 +106,13 @@ public class SlimApp {
     /** 看图对话的用户消息模板名。 */
     public static final String IMAGE_EXPLAIN_TEMPLATE = "image-explain";
 
-    /** 用户没写提问时，用这句当默认问题。 */
-    private static final String DEFAULT_IMAGE_QUESTION = "请帮我看看这张图片，说说和我的健康管理有什么关系。";
+    /**
+     * 用户没写提问时，用这句当默认问题。
+     *
+     * <p>它会被拼进**发给模型**的消息里，所以也走语言包：模型模仿的正是它收到的那段
+     * 上下文，给它递一句中文提问，它多半就回中文——哪怕界面上全是英文。
+     */
+    private static final String DEFAULT_IMAGE_QUESTION_KEY = "slim.image.defaultQuestion";
 
     private final ChatClient chatClient;
     private final ChatClient visionChatClient;
@@ -228,12 +234,12 @@ public class SlimApp {
      *                写反了能编译通过</b>，而表现是用户画像被存到了会话 id 上——
      *                所有入口都要保持 {@code (message, chatId, userId)} 这个顺序
      */
-    public String chat(String message, String chatId, String userId) {
+    public String chat(String message, String chatId, String userId, Messages i18n) {
         String reply = chatClient.prompt()
-                .system(renderSystemPrompt())
+                .system(renderSystemPrompt(i18n))
                 .user(message)
                 .advisors(spec -> spec.param(ChatMemory.CONVERSATION_ID, chatId))
-                .toolContext(toolContext(userId))
+                .toolContext(ToolContexts.of(userId, chatId))
                 .call()
                 .content();
         record(chatId, ChatScene.SLIM, message, reply);
@@ -241,15 +247,15 @@ public class SlimApp {
     }
 
     /** 多轮对话（流式），返回逐段生成的文本。参数顺序同 {@link #chat}。 */
-    public Flux<String> chatStream(String message, String chatId, String userId) {
+    public Flux<String> chatStream(String message, String chatId, String userId, Messages i18n) {
         // 流式拿不到一个「最终的字符串」，只能自己把分片攒起来；
         // 攒的动作和 LoggingAdvisor 汇总日志是同一个套路
         StringBuilder reply = new StringBuilder();
         return chatClient.prompt()
-                .system(renderSystemPrompt())
+                .system(renderSystemPrompt(i18n))
                 .user(message)
                 .advisors(spec -> spec.param(ChatMemory.CONVERSATION_ID, chatId))
-                .toolContext(toolContext(userId))
+                .toolContext(ToolContexts.of(userId, chatId))
                 .stream()
                 .content()
                 .doOnNext(reply::append)
@@ -275,15 +281,18 @@ public class SlimApp {
      * @param chatId   会话 ID
      * @param userId   发起这次对话的用户 id，参数顺序同 {@link #chat}
      */
-    public String explainImage(String question, Resource image, MimeType mimeType, String chatId, String userId) {
-        String ask = (question == null || question.isBlank()) ? DEFAULT_IMAGE_QUESTION : question;
-        String userText = promptTemplateLoader.render(IMAGE_EXPLAIN_TEMPLATE, Map.of("question", ask));
+    public String explainImage(String question, Resource image, MimeType mimeType, String chatId, String userId,
+                               Messages i18n) {
+        String ask = (question == null || question.isBlank())
+                ? i18n.get(DEFAULT_IMAGE_QUESTION_KEY)
+                : question;
+        String userText = promptTemplateLoader.render(i18n, IMAGE_EXPLAIN_TEMPLATE, Map.of("question", ask));
 
         String reply = visionChatClient.prompt()
-                .system(promptTemplateLoader.render(VISION_SYSTEM_TEMPLATE, Map.of()))
+                .system(promptTemplateLoader.render(i18n, VISION_SYSTEM_TEMPLATE, Map.of()))
                 .user(spec -> spec.text(userText).media(mimeType, image))
                 .advisors(spec -> spec.param(ChatMemory.CONVERSATION_ID, chatId))
-                .toolContext(toolContext(userId))
+                .toolContext(ToolContexts.of(userId, chatId))
                 .call()
                 .content();
         // 记的是 ask（用户没提问时那句默认问题），不是模板渲染后的正文——
@@ -320,37 +329,29 @@ public class SlimApp {
      * <p>每次请求都重新渲染，而不是在构造时渲染一次：模板里的 {@code {today}}
      * 需要反映当天日期，服务长期运行也不会把日期讲错。渲染本身只是字符串替换，开销可以忽略。
      */
-    private String renderSystemPrompt() {
-        return promptTemplateLoader.render(SYSTEM_TEMPLATE, Map.of(
-                "nickname", promptProperties.getNickname(),
+    /**
+     * 拼这一轮的系统提示词。
+     *
+     * <p><b>它跟着语言走。</b>{@code slim-app-system.st} 里写着「使用简体中文」，
+     * 拿去给英文用户用，模型会一路用中文回答——哪怕界面上全是英文。
+     * 所以英文走 {@code -en} 那一份。称呼同理：「朋友」对英文用户是个看不懂的词。
+     */
+    private String renderSystemPrompt(Messages i18n) {
+        return promptTemplateLoader.render(i18n, SYSTEM_TEMPLATE, Map.of(
+                "nickname", i18n.isChinese()
+                        ? promptProperties.getNickname()
+                        : promptProperties.getNicknameEn(),
                 "today", LocalDate.now().toString()));
     }
 
-    /**
-     * 每个请求都要带的工具上下文，用来回答工具那句「现在跟我说话的是谁」。
+    /*
+     * 工具上下文不在这里拼，统一走 `ToolContexts.of(userId, chatId)`——
+     * 上面三个入口（chat / chatStream / explainImage）都调它，一个都不能漏。
      *
-     * <p>这个值不会出现在工具的 JSON Schema 里，也就是模型看不到、更传不了它——
-     * 这正是我们要的：用户身份不能由模型自己填，否则它会编一个出来，
-     * 这次存下的画像下次就找不回来了。
-     *
-     * <p><b>四个对话入口一个都不能漏。</b>凡是声明了 {@code ToolContext} 参数的工具，
-     * 在没有上下文的请求里被调用时，Spring AI 会直接抛
-     * {@code IllegalArgumentException: ToolContext is required by the method as an argument}——
-     * 也就是说漏掉这一行不是「画像读不到」，而是整个对话直接失败。
-     *
-     * <p>传进来的是<b>真实用户 id</b>（由 HTTP 层从令牌里解出，见 {@code SlimAppController}）。
-     * 在这之前它用的是会话 ID，代价是「换个会话就等于换了个人」——同一个用户在轻语里说过的
-     * 身高体重，新开一个会话就查不到了。
-     *
-     * <p>user id 为空时返回空 map 而不是塞一个 null 进去：{@code Map.of} 遇到 null 会直接抛
-     * {@code NullPointerException}，而 {@code ToolContext} 的底层实现也可能对内容做
-     * 防御性拷贝。留键缺失是安全的——{@code UserProfileTool} 能处理这种情况，
-     * 会回一句「暂时记不住这些信息」让模型转告用户，对话本身不中断。
-     * 正常链路上走不到（聊天接口都要求登录），这是防「万一」的。
+     * 原先这里是一个私有的 `toolContext(userId)`，user id 为空时返回空 map。
+     * 那是个雷：Spring AI 在「方法声明了 ToolContext 参数、而传进来的 map 是空的」
+     * 时会直接抛 IllegalArgumentException，所以漏传的代价不是「画像读不到」
+     * 而是整轮对话失败。ToolContexts 里的实现保证 map 永远非空，
+     * 顺便把「工具也要知道自己在哪个会话里」补上了（资料库归档要用 chatId）。
      */
-    private static Map<String, Object> toolContext(String userId) {
-        return StringUtils.hasText(userId)
-                ? Map.of(UserProfileTool.USER_ID_KEY, userId)
-                : Map.of();
-    }
 }

@@ -285,15 +285,12 @@ public class PgVectorIndexService {
                     .withIncludeCodeBlock(false)
                     .withIncludeBlockquote(true)
                     .build());
-            default -> throw ApiException.unsupportedDocument(
-                    "只支持 " + SUPPORTED_EXTENSIONS + " 这几种文本格式，当前文件是「" + source + "」，"
-                            + "识别出的后缀是「" + normalizedExtension + "」。"
-                            + "PDF / Word 需要先转成文本再上传。");
+            default -> throw ApiException.unsupportedDocument("error.kb.extensionUnsupported", SUPPORTED_EXTENSIONS, source, normalizedExtension);
         };
 
         List<Document> documents = reader.get();
         if (documents.isEmpty() || documents.stream().allMatch(document -> !StringUtils.hasText(document.getText()))) {
-            throw ApiException.documentIndexFailed("文档内容为空，没什么可索引的：" + source);
+            throw ApiException.documentIndexFailed("error.kb.contentEmpty", source);
         }
 
         String docName = source;
@@ -324,16 +321,14 @@ public class PgVectorIndexService {
         List<Document> chunks = splitter.apply(documents);
 
         if (chunks.isEmpty()) {
-            throw ApiException.documentIndexFailed("切片结果为空，文档可能只有空白字符：" + source);
+            throw ApiException.documentIndexFailed("error.kb.chunksEmpty", source);
         }
 
         // TokenTextSplitter 到 maxNumChunks 就不再加了，超出的内容被静默丢弃。
         // 撞上上限就当作失败处理，而不是索引一份「只有前一半」的文档
         int maxNumChunks = pgVectorProperties.getChunk().getMaxNumChunks();
         if (chunks.size() >= maxNumChunks) {
-            throw ApiException.documentIndexFailed(
-                    "切片数达到上限 " + maxNumChunks + "，超出的内容会被丢弃。请把文档拆小后分几次上传，"
-                            + "或调大 purify.rag.pgvector.chunk.max-num-chunks：" + source);
+            throw ApiException.documentIndexFailed("error.kb.chunkLimitReached", maxNumChunks, source);
         }
 
         for (int i = 0; i < chunks.size(); i++) {
@@ -352,9 +347,7 @@ public class PgVectorIndexService {
             replaced += text.chars().filter(character -> character == '�').count();
         }
         if (total > 0 && (double) replaced / total > REPLACEMENT_CHAR_RATIO_LIMIT) {
-            throw ApiException.documentIndexFailed(
-                    "文档内容不是有效的 UTF-8（" + replaced + "/" + total + " 个字符无法解码）：" + source
-                            + "。请另存为 UTF-8 编码后重新上传。");
+            throw ApiException.documentIndexFailed("error.kb.notUtf8", replaced, total, source);
         }
     }
 
@@ -366,7 +359,7 @@ public class PgVectorIndexService {
      */
     private String requireKnownClassification(String classification) {
         if (!StringUtils.hasText(classification)) {
-            throw ApiException.unsupportedDocument("必须指定 classification（归档到哪一类）");
+            throw ApiException.unsupportedDocument("error.kb.classificationRequired");
         }
         String category = classification.trim();
 
@@ -376,15 +369,14 @@ public class PgVectorIndexService {
                 .toList();
         // 分类表没配时不拦：配置缺失不该让上传功能整个不可用
         if (!known.isEmpty() && !known.contains(category)) {
-            throw ApiException.unsupportedDocument(
-                    "未知的分类「" + category + "」，可选值来自 purify.rag.router.categories：" + known);
+            throw ApiException.unsupportedDocument("error.kb.classificationUnknown", category, known);
         }
         return category;
     }
 
     private static String requireFilename(String filename) {
         if (!StringUtils.hasText(filename)) {
-            throw ApiException.unsupportedDocument("文件名不能为空：它同时用作切片来源标识，删改都靠它");
+            throw ApiException.unsupportedDocument("error.kb.filenameRequired");
         }
         return filename.trim();
     }

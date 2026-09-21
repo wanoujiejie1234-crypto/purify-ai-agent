@@ -1,6 +1,7 @@
 package com.purify.purifyaiagent.prompt;
 
 import com.purify.purifyaiagent.config.PromptProperties;
+import com.purify.purifyaiagent.i18n.Messages;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.prompt.PromptTemplate;
 import org.springframework.core.io.DefaultResourceLoader;
@@ -33,6 +34,9 @@ public class PromptTemplateLoader {
     /** 模板文件后缀。用 .st 是为了让编辑器按 StringTemplate 语法高亮。 */
     private static final String TEMPLATE_SUFFIX = ".st";
 
+    /** 英文模板的文件名后缀：{@code slim-app-system} → {@code slim-app-system-en}。 */
+    private static final String EN_SUFFIX = "-en";
+
     private final String location;
     private final Map<String, PromptTemplate> cache = new ConcurrentHashMap<>();
 
@@ -50,6 +54,21 @@ public class PromptTemplateLoader {
     /** 按模板名渲染出最终文本，{@code variables} 需要覆盖模板里的全部变量。 */
     public String render(String name, Map<String, Object> variables) {
         return get(name).render(variables);
+    }
+
+    /**
+     * 按语言选一份模板再渲染：非中文用 {@code <name>-en}，中文用 {@code <name>}。
+     *
+     * <p><b>为什么是「加后缀」而不是把两套模板的正文放进 properties。</b>
+     * 系统提示词是几十行 markdown，塞进 properties 会变成一堆带 {@code \n} 转义的长字符串，
+     * 谁也没法维护；而它本来就是一个独立的、可以被产品同学直接改的文件。
+     *
+     * <p><b>-en 那一份必须真实存在</b>，否则会在第一个英文请求上抛
+     * {@code IllegalStateException}（见 {@link #read}），而不是启动失败——
+     * 所以加模板时要两个文件一起加，{@code PromptTemplateParityTest} 会盯着这件事。
+     */
+    public String render(Messages i18n, String name, Map<String, Object> variables) {
+        return render(i18n.isChinese() ? name : name + EN_SUFFIX, variables);
     }
 
     private PromptTemplate read(String name) {

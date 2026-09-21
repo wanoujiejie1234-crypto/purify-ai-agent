@@ -1,6 +1,7 @@
 package com.purify.purifyaiagent.controller;
 
 import com.purify.purifyaiagent.auth.AuthService;
+import com.purify.purifyaiagent.auth.AvatarStorage;
 import com.purify.purifyaiagent.auth.LoginUser;
 import com.purify.purifyaiagent.auth.UserRepository;
 import com.purify.purifyaiagent.auth.CurrentUser;
@@ -10,6 +11,7 @@ import com.purify.purifyaiagent.auth.VerificationPurpose;
 import com.purify.purifyaiagent.auth.VerifyCodeService;
 import com.purify.purifyaiagent.exception.ApiException;
 import com.purify.purifyaiagent.exception.AuthException;
+import com.purify.purifyaiagent.media.ImageTypes;
 import com.purify.purifyaiagent.model.AuthUserView;
 import com.purify.purifyaiagent.model.LoginRequest;
 import com.purify.purifyaiagent.model.LoginResponse;
@@ -18,13 +20,16 @@ import com.purify.purifyaiagent.model.ResetPasswordRequest;
 import com.purify.purifyaiagent.model.SendCodeRequest;
 import jakarta.servlet.http.HttpServletRequest;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.multipart.MultipartFile;
 
 import java.util.Map;
 
@@ -66,13 +71,16 @@ public class AuthController {
     private final AuthService authService;
     private final VerifyCodeService verifyCodeService;
     private final UserRepository userRepository;
+    private final AvatarStorage avatarStorage;
 
     public AuthController(AuthService authService,
                           VerifyCodeService verifyCodeService,
-                          UserRepository userRepository) {
+                          UserRepository userRepository,
+                          AvatarStorage avatarStorage) {
         this.authService = authService;
         this.verifyCodeService = verifyCodeService;
         this.userRepository = userRepository;
+        this.avatarStorage = avatarStorage;
     }
 
     /**
@@ -98,11 +106,11 @@ public class AuthController {
         // 「邮箱不存在就假装成功」分支，返回一句「验证码已发送」——
         // 而用户根本没填邮箱，什么都没有发生，他会在那儿一直等
         if (!StringUtils.hasText(email)) {
-            throw ApiException.authInvalid("邮箱不能为空");
+            throw ApiException.authInvalid("error.auth.emailRequired");
         }
 
         if (purpose == VerificationPurpose.REGISTER && userRepository.emailExists(email)) {
-            throw ApiException.authInvalid("这个邮箱已经注册过了，直接登录或用「忘记密码」找回");
+            throw ApiException.authInvalid("error.auth.emailTaken");
         }
 
         // 找回密码这条链路：邮箱存不存在，**响应必须逐字相同**。
@@ -165,8 +173,41 @@ public class AuthController {
         // 令牌是无状态的，服务端不知道账号没了，只有查一次库才知道
         UserAccount account = userRepository.findById(Long.valueOf(me.id()))
                 .filter(UserAccount::canLogin)
-                .orElseThrow(() -> AuthException.unauthorized("这个账号已不可用，请重新登录"));
+                .orElseThrow(() -> AuthException.unauthorized("error.auth.accountGone"));
         return AuthUserView.from(account);
+    }
+
+    /**
+     * 换头像。
+     *
+     * <p>返回刷新后的用户信息（和 {@code /me} 同一个结构），前端直接拿它更新本地那份，
+     * 不用再问一次服务端。
+     *
+     * <p><b>先存新的、再删旧的</b>，顺序不能反：反过来的话，万一新图写盘失败，
+     * 用户就落得一个头像被删、新的又没存上的状态——而重传一次本来是可以救回来的。
+     * 代价是失败时会在磁盘上留一个孤儿文件，那比用户丢头像轻得多。
+     *
+     * <p>删旧图失败只记日志（见 {@code AvatarStorage#deleteQuietly}），
+     * 不影响本次更换的结果。
+     */
+    @PostMapping(value = "/avatar", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    @RequireLogin
+    public AuthUserView uploadAvatar(@RequestParam("file") MultipartFile file,
+                                     @CurrentUser LoginUser me) {
+        UserAccount account = userRepository.findById(Long.valueOf(me.id()))
+                .filter(UserAccount::canLogin)
+                .orElseThrow(() -> AuthException.unauthorized("error.auth.accountGone"));
+
+        String url = avatarStorage.store(file, ImageTypes.DEFAULT_MAX_BYTES);
+        userRepository.updateAvatar(account.id(), url);
+        // account 是改之前读出来的，它身上还是旧地址——正好拿来删旧文件
+        avatarStorage.deleteQuietly(account.avatar());
+
+        // 重新读一次而不是手工拼一个返回值：拼的话就得把 UserAccount 的十几个字段
+        // 抄一遍，抄漏一个就会返回一份和库里不一致的数据。头像不是高频操作，多一次查询无所谓
+        UserAccount updated = userRepository.findById(account.id())
+                .orElseThrow(() -> AuthException.unauthorized("error.auth.accountGone"));
+        return AuthUserView.from(updated);
     }
 
     /**

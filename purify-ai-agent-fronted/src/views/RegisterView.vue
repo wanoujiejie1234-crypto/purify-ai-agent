@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import AuthShell from '../components/AuthShell.vue'
 import * as authApi from '../api/auth.js'
 import { useVerifyCode } from '../useVerifyCode.js'
+import { message, rawMessage, resolveMessage } from '../i18n/index.js'
 
 /**
  * 注册页。
@@ -23,8 +24,8 @@ const {
   email,
   sending: codeSending,
   countdown,
-  note: codeNote,
-  error: codeError,
+  noteText: codeNote,
+  errorText: codeError,
   send: sendCode,
   restoreCountdown,
 } = useVerifyCode(authApi.PURPOSE.REGISTER)
@@ -33,8 +34,11 @@ const username = ref('')
 const password = ref('')
 const confirm = ref('')
 const codeValue = ref('')
-const formError = ref('')
+/** 存描述符不是句子，见 i18n/index.js 的 message() */
+const formError = ref(null)
 const submitting = ref(false)
+
+const formErrorText = computed(() => resolveMessage(formError.value))
 
 /**
  * 两边密码一致才能提交。
@@ -58,14 +62,14 @@ const canSubmit = computed(
 
 async function submit() {
   if (submitting.value) return
-  formError.value = ''
+  formError.value = null
 
   if (passwordMismatch.value) {
-    formError.value = '两次输入的密码不一样'
+    formError.value = message('auth.register.mismatch')
     return
   }
   if (password.value.length < 8) {
-    formError.value = '密码至少 8 位'
+    formError.value = message('auth.register.passwordTooShort')
     return
   }
 
@@ -82,7 +86,7 @@ async function submit() {
     // 注册成功即登录（后端一并签发了令牌），直接进首页
     await router.replace('/')
   } catch (err) {
-    formError.value = err.message || '注册失败，请稍后重试。'
+    formError.value = err.message ? rawMessage(err.message) : message('auth.register.failed')
   } finally {
     submitting.value = false
   }
@@ -90,10 +94,10 @@ async function submit() {
 </script>
 
 <template>
-  <AuthShell title="创建账号" subtitle="需要一个能收信的邮箱来完成验证。">
+  <AuthShell :title="$t('auth.register.title')" :subtitle="$t('auth.register.subtitle')">
     <form @submit.prevent="submit">
       <label class="field">
-        <span class="field-label">邮箱</span>
+        <span class="field-label">{{ $t('auth.register.email') }}</span>
         <span class="field-row">
           <input
             v-model="email"
@@ -111,15 +115,15 @@ async function submit() {
             :disabled="codeSending || countdown > 0 || submitting"
             @click="sendCode()"
           >
-            <template v-if="countdown > 0">{{ countdown }}s 后重发</template>
-            <template v-else-if="codeSending">发送中…</template>
-            <template v-else>获取验证码</template>
+            <template v-if="countdown > 0">{{ $t('auth.code.resendIn', { n: countdown }) }}</template>
+            <template v-else-if="codeSending">{{ $t('auth.code.sending') }}</template>
+            <template v-else>{{ $t('auth.code.send') }}</template>
           </button>
         </span>
       </label>
 
       <label class="field">
-        <span class="field-label">验证码</span>
+        <span class="field-label">{{ $t('auth.register.code') }}</span>
         <input
           v-model="codeValue"
           class="field-input"
@@ -128,41 +132,41 @@ async function submit() {
           inputmode="numeric"
           autocomplete="one-time-code"
           maxlength="6"
-          placeholder="6 位数字"
+          :placeholder="$t('auth.register.codePlaceholder')"
           :disabled="submitting"
         />
       </label>
 
       <label class="field">
-        <span class="field-label">用户名</span>
+        <span class="field-label">{{ $t('auth.register.username') }}</span>
         <input
           v-model="username"
           class="field-input"
           type="text"
           name="username"
           autocomplete="username"
-          placeholder="3-20 个字符"
+          :placeholder="$t('auth.register.usernamePlaceholder')"
           :disabled="submitting"
         />
       </label>
 
       <label class="field">
-        <span class="field-label">密码</span>
+        <span class="field-label">{{ $t('auth.register.password') }}</span>
         <input
           v-model="password"
           class="field-input"
           type="password"
           name="password"
           autocomplete="new-password"
-          placeholder="至少 8 位"
+          :placeholder="$t('auth.register.passwordPlaceholder')"
           :disabled="submitting"
         />
       </label>
 
       <label class="field">
         <span class="field-label">
-          确认密码
-          <span v-if="passwordMismatch" class="field-hint">两次输入不一致</span>
+          {{ $t('auth.register.confirm') }}
+          <span v-if="passwordMismatch" class="field-hint">{{ $t('auth.register.mismatchHint') }}</span>
         </span>
         <input
           v-model="confirm"
@@ -170,22 +174,22 @@ async function submit() {
           type="password"
           name="confirm"
           autocomplete="new-password"
-          placeholder="再输一遍"
+          :placeholder="$t('auth.register.confirmPlaceholder')"
           :disabled="submitting"
         />
       </label>
 
       <p v-if="codeNote" class="form-note">{{ codeNote }}</p>
       <p v-if="codeError" class="form-error">{{ codeError }}</p>
-      <p v-if="formError" class="form-error">{{ formError }}</p>
+      <p v-if="formErrorText" class="form-error">{{ formErrorText }}</p>
 
       <button class="btn-primary" type="submit" :disabled="!canSubmit">
-        {{ submitting ? '注册中…' : '注册并登录' }}
+        {{ submitting ? $t('auth.register.submitting') : $t('auth.register.submit') }}
       </button>
     </form>
 
     <template #footer>
-      已经有账号了？<RouterLink to="/login">去登录</RouterLink>
+      {{ $t('auth.register.hasAccount') }}<RouterLink to="/login">{{ $t('auth.register.toLogin') }}</RouterLink>
     </template>
   </AuthShell>
 </template>

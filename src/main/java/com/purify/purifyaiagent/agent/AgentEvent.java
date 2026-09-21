@@ -56,8 +56,15 @@ public record AgentEvent(Type type, String text, AgentState state) {
         ERROR
     }
 
-    public static AgentEvent step(int index) {
-        return new AgentEvent(Type.STEP, "第 " + index + " 步", null);
+    /**
+     * 每一步开头的那条「第 N 步」。
+     *
+     * <p>收 {@link AgentRun} 而不是一个 int，是为了拿到这次 run 的语言：
+     * 这一段会原样显示在界面的过程区里，英文用户不该看到「第 3 步」。
+     * 序号仍然从 run 上取（{@code nextStepIndex}），保证它和记录里的口径是同一个。
+     */
+    public static AgentEvent step(AgentRun run) {
+        return new AgentEvent(Type.STEP, run.i18n().get("agent.step", run.nextStepIndex()), null);
     }
 
     public static AgentEvent text(String delta) {

@@ -122,17 +122,17 @@ public class AuthInterceptor implements HandlerInterceptor {
 
     private static void requireLogin(LoginUser loginUser) {
         if (loginUser == null) {
-            throw AuthException.unauthorized("请先登录");
+            throw AuthException.unauthorized("error.auth.loginRequired");
         }
     }
 
     private static void requireAdmin(LoginUser loginUser, HttpServletRequest request) {
         if (loginUser == null) {
-            throw AuthException.unauthorized("请先登录");
+            throw AuthException.unauthorized("error.auth.loginRequired");
         }
         if (!loginUser.isAdmin()) {
             log.warn("[Auth] 权限不足：{} 尝试访问 {}", loginUser.describe(), request.getRequestURI());
-            throw AuthException.forbidden("这个功能只对超级管理员开放");
+            throw AuthException.forbidden("error.auth.adminOnly");
         }
     }
 

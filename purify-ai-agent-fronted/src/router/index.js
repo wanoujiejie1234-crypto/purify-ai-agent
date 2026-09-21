@@ -20,9 +20,23 @@ const routes = [
   { path: '/register', name: 'register', component: () => import('../views/RegisterView.vue'), meta: { guestOnly: true } },
   { path: '/forgot', name: 'forgot', component: () => import('../views/ForgotPasswordView.vue'), meta: { guestOnly: true } },
 
-  // 两个聊天室都拆成异步 chunk：主页是纯静态的入口，不该被聊天页的代码拖慢首屏
-  { path: '/slim', name: 'slim', component: () => import('../views/SlimView.vue'), meta: { requiresAuth: true } },
-  { path: '/manus', name: 'manus', component: () => import('../views/ManusView.vue'), meta: { requiresAuth: true } },
+  // 两个聊天室都拆成异步 chunk：主页是纯静态的入口，不该被聊天页的代码拖慢首屏。
+  //
+  // chatTheme 标出「这个页面吃深色主题」。深色只作用于对话页，而 `ChatRoom` 是异步
+  // chunk、要等加载完才挂载，所以 main.js 需要在挂载前就据此把主题类挂上，
+  // 否则深色用户刷新对话页会先闪一下白。见 main.js 里的说明
+  {
+    path: '/slim',
+    name: 'slim',
+    component: () => import('../views/SlimView.vue'),
+    meta: { requiresAuth: true, chatTheme: true },
+  },
+  {
+    path: '/manus',
+    name: 'manus',
+    component: () => import('../views/ManusView.vue'),
+    meta: { requiresAuth: true, chatTheme: true },
+  },
 
   // 知识库管理。和聊天页一样异步加载，而且只有超级用户进得来
   {

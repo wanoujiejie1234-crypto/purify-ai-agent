@@ -49,6 +49,23 @@ export async function login(username, password) {
   return data.user
 }
 
+/**
+ * 换头像。
+ *
+ * 成功了要把返回的用户信息写回本地那份（`auth.updateUser`）——否则头像在界面上
+ * 要等下一次刷新才出现，用户会以为没传上去又传一遍。
+ *
+ * 这里不做类型和大小的校验：那些规则在后端（`ImageTypes`），前端再判一遍
+ * 只会多一份会走偏的副本。传错了后端会返回一句能看懂的话，直接展示即可。
+ */
+export async function uploadAvatar(file) {
+  const form = new FormData()
+  form.append('file', file)
+  const { data } = await http.post('/api/auth/avatar', form)
+  auth.updateUser(data)
+  return data
+}
+
 /** 用邮箱验证码重置密码。成功后**不会**自动登录，要用户自己用新密码登一次。 */
 export async function resetPassword(email, code, newPassword) {
   await http.post('/api/auth/password/reset', { email, code, newPassword })

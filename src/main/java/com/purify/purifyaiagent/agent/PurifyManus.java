@@ -7,7 +7,8 @@ import com.purify.purifyaiagent.config.PromptProperties;
 import com.purify.purifyaiagent.model.ChatRecord;
 import com.purify.purifyaiagent.prompt.PromptTemplateLoader;
 import com.purify.purifyaiagent.rag.KnowledgeSearch;
-import com.purify.purifyaiagent.tools.UserProfileTool;
+import com.purify.purifyaiagent.agent.tool.ToolContexts;
+import com.purify.purifyaiagent.i18n.Messages;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.model.tool.ToolCallingManager;
@@ -92,8 +93,10 @@ public class PurifyManus extends ToolCallAgent {
                 toolCallbacks,
                 toolCallingManager,
                 // 每次调用现渲染：提示词里的 {today} 必须反映当天日期，服务长期运行才不会把日期讲错
-                () -> promptTemplateLoader.render(SYSTEM_TEMPLATE, Map.of(
-                        "nickname", promptProperties.getNickname(),
+                (run) -> promptTemplateLoader.render(run.i18n(), SYSTEM_TEMPLATE, Map.of(
+                        "nickname", run.i18n().isChinese()
+                                ? promptProperties.getNickname()
+                                : promptProperties.getNicknameEn(),
                         "today", LocalDate.now().toString())));
         this.chatRecordRepository = chatRecordRepository;
         this.knowledgeSearch = knowledgeSearch;
@@ -152,7 +155,7 @@ public class PurifyManus extends ToolCallAgent {
                 // （question 是原话，answer 是引导话术）。那两张表是给人查的账本，
                 // 拦截不该让账本缺一笔。用户下一句说「我开玩笑的，接着说」时模型没有
                 // 这段上下文，是拿连续性换「有害内容不进模型记忆」，这个取舍是有意的
-                run.finish(AgentState.BLOCKED, sensitiveWordChecker.replyMessage());
+                run.finish(AgentState.BLOCKED, sensitiveWordChecker.replyMessage(run.i18n().locale()));
                 return Flux.empty();
             }
 
@@ -173,19 +176,19 @@ public class PurifyManus extends ToolCallAgent {
      */
     private String preRetrieve(AgentRun run, String question) {
         if (!StringUtils.hasText(question)) {
-            return "知识库检索：本轮没有可检索的问题，已跳过";
+            return run.i18n().get("agent.retrievalSkipped");
         }
         try {
             KnowledgeSearch.Result result = knowledgeSearch.search(question);
             // 材料为空时 renderAgentReference 返回空串，buildPrompt 那边据此跳过注入
             // （往 Prompt 里塞一句「知识库没查到」会诱导模型当场拒答，理由见那个方法的注释）
             run.setReferenceContext(result.renderAgentReference());
-            return result.summary();
+            return result.summary(run.i18n());
         }
         catch (RuntimeException exception) {
             log.warn("[PurifyManus] 会话 {} 开场预检索失败，本轮按无参考资料处理：{}",
                     run.chatId(), exception.getMessage());
-            return "知识库检索失败（" + exception.getMessage() + "），本轮没有参考资料，可改用其它工具";
+            return run.i18n().get("agent.retrievalFailed", exception.getMessage());
         }
     }
 
@@ -200,12 +203,12 @@ public class PurifyManus extends ToolCallAgent {
      * 这个方法留给不走 HTTP 的调用方和测试——它和流式那条复用同一个循环，
      * 只是把结果攒起来再返回。
      */
-    public AgentResult chat(String chatId, String userId, String message) {
+    public AgentResult chat(String chatId, String userId, Messages i18n, String message) {
         if (!acquire(chatId)) {
-            return busy(chatId);
+            return busy(chatId, i18n);
         }
         try {
-            AgentResult result = runBlocking(chatId, userId, message);
+            AgentResult result = runBlocking(chatId, userId, i18n, message);
             record(chatId, message, answerOf(result), result.state(), result.steps());
             return result;
         }
@@ -221,17 +224,17 @@ public class PurifyManus extends ToolCallAgent {
      * 真正的执行发生在订阅时。若把闸门放在方法体里，调用方拿着流不订阅（比如请求刚进来就被
      * 网关掐了），闸门就永远关不上了。
      */
-    public Flux<AgentEvent> chatStream(String chatId, String userId, String message) {
+    public Flux<AgentEvent> chatStream(String chatId, String userId, Messages i18n, String message) {
         return Flux.defer(() -> {
             if (!acquire(chatId)) {
-                return Flux.just(AgentEvent.error(busyMessage()));
+                return Flux.just(AgentEvent.error(busyMessage(i18n)));
             }
             // 流式没有「一个最终结果」可以事后取，只能在流的过程中把要落库的两样东西攒下来：
             // 终态事件（答复和收尾状态都在里面）和步数
             AtomicReference<AgentEvent> terminal = new AtomicReference<>();
             AtomicInteger steps = new AtomicInteger();
 
-            return runStream(chatId, userId, message)
+            return runStream(chatId, userId, i18n, message)
                     .doOnNext(event -> {
                         if (event.state() != null) {
                             terminal.set(event);
@@ -264,11 +267,14 @@ public class PurifyManus extends ToolCallAgent {
     @Override
     protected Map<String, Object> toolContext(AgentRun run) {
         // 父类放进去的 HumanInterrupt 原样留着（那是「暂停等用户」的开关，本类也要用），
-        // 这里只补一样：用户是谁
+        // 这里补上「用户是谁」和「在哪个会话里」。
+        //
+        // 键名和取值都走 ToolContexts：这边和 SlimApp 那两个入口拼的是同一份上下文，
+        // 各写一遍的话，哪天加了一个工具需要的键，很容易只改了其中一边，
+        // 而症状是「某个功能只在某条链路上不工作」。
         Map<String, Object> context = new HashMap<>(super.toolContext(run));
-        if (StringUtils.hasText(run.userId())) {
-            context.put(UserProfileTool.USER_ID_KEY, run.userId());
-        }
+        ToolContexts.putIfPresent(context, ToolContexts.USER_ID_KEY, run.userId());
+        ToolContexts.putIfPresent(context, ToolContexts.CHAT_ID_KEY, run.chatId());
         return context;
     }
 
@@ -311,12 +317,18 @@ public class PurifyManus extends ToolCallAgent {
         runningConversations.remove(chatId);
     }
 
-    private AgentResult busy(String chatId) {
+    private AgentResult busy(String chatId, Messages i18n) {
         log.warn("[PurifyManus] 会话 {} 已有一个任务在跑，拒绝并发请求", chatId);
-        return new AgentResult(chatId, AgentState.ERROR, busyMessage(), null, 0, 0, List.of());
+        return new AgentResult(chatId, AgentState.ERROR, busyMessage(i18n), null, 0, 0, List.of());
     }
 
-    private static String busyMessage() {
-        return "这个会话上一个任务还没跑完，等它结束再发下一条吧（或者换一个会话 ID 重新开始）。";
+    /**
+     * 「上个任务还没跑完」那句话。
+     *
+     * <p>收 {@link Messages} 而不是自己去取语言：它的一个调用点在 {@code Flux.defer} 里面
+     * （见 {@link #chatStream}），那已经不在请求线程上了。
+     */
+    private static String busyMessage(Messages i18n) {
+        return i18n.get("agent.busy");
     }
 }

@@ -87,6 +87,35 @@ button {
   background: transparent;
 }
 
+/*
+ * 对话页的深色主题。
+ *
+ * 只有两条规则需要放在全局：**它们的作用范围在组件之外**。
+ * 其余所有颜色都在 ChatRoom.vue 的 scoped 样式里（`.shell.dark` 那一块），
+ * 而 scoped 样式够不到底下这两处：
+ *
+ *   1. `body` 的背景 —— 上面 body 那条规则画的是 `var(--page)`（浅灰）。
+ *      对话页自己的 `.shell` 盖满 100dvh，平时看不见它；但 iOS/触屏
+ *      在页面边缘 overscroll 时会露出这一圈，浅色底配深色界面非常刺眼。
+ *   2. 滚动条 —— 上面是 `*` 选择器，写在组件里根本覆盖不掉。
+ *
+ * **刻意只加这一个类，不改 `:root` 里的变量。** 那两个变量（--page/--ink/--line）
+ * 是首页、登录注册、知识库共用的，一改就会把那些仍然只有浅色的页面带偏。
+ *
+ * `theme-dark` 这个类只在对话页开着的时候挂在 `<html>` 上，
+ * 离开对话页会被摘掉——见 `src/theme.js` 的 enterChatPage / leaveChatPage。
+ */
+html.theme-dark body {
+  background: #0f1115;
+}
+
+html.theme-dark * {
+  scrollbar-color: rgba(150, 160, 180, 0.3) transparent;
+}
+html.theme-dark *::-webkit-scrollbar-thumb {
+  background: rgba(150, 160, 180, 0.28);
+}
+
 /* ==========================================================================
  * 表单基元
  *

@@ -1,5 +1,6 @@
-import { onBeforeUnmount, ref } from 'vue'
+import { computed, onBeforeUnmount, ref } from 'vue'
 import * as authApi from './api/auth.js'
+import { message, rawMessage, resolveMessage } from './i18n/index.js'
 
 /**
  * 「填邮箱 → 发验证码 → 倒计时」这一小段交互。注册页和找回密码页共用。
@@ -28,9 +29,19 @@ export function useVerifyCode(purpose) {
   const sending = ref(false)
   /** 剩余秒数。大于 0 时按钮禁用并显示倒计时。 */
   const countdown = ref(0)
-  /** 中性提示（「验证码已发送」这类）。 */
-  const note = ref('')
-  const error = ref('')
+  /**
+   * 中性提示（「验证码已发送」这类）和错误。
+   *
+   * **存的是描述符不是句子**（见 i18n/index.js 的 message()）：这两个 ref 会被
+   * 直接渲染到注册页和找回密码页上，存句子的话切了语言它们不会重算，
+   * 表现是「界面英文了，一点获取验证码又冒出一句中文」。
+   * 所以这里额外给出 `noteText` / `errorText` 两个翻好的版本，模板直接用它。
+   */
+  const note = ref(null)
+  const error = ref(null)
+
+  const noteText = computed(() => resolveMessage(note.value))
+  const errorText = computed(() => resolveMessage(error.value))
 
   let timer = null
 
@@ -68,12 +79,12 @@ export function useVerifyCode(purpose) {
   async function send() {
     if (sending.value || countdown.value > 0) return
 
-    error.value = ''
-    note.value = ''
+    error.value = null
+    note.value = null
 
     const address = email.value.trim()
     if (!address) {
-      error.value = '请先填写邮箱'
+      error.value = message('auth.code.needEmail')
       return
     }
 
@@ -85,9 +96,9 @@ export function useVerifyCode(purpose) {
       startCountdown(RESEND_SECONDS)
       // 用服务端那句话。找回密码那条链路无论邮箱存不存在都是同一句
       // （后端刻意不泄露账号是否存在），原样显示才对得上
-      note.value = result?.message || '验证码已发送，请查收邮箱。'
+      note.value = result?.message ? rawMessage(result.message) : message('auth.code.sent')
     } catch (err) {
-      error.value = err.message || '发送失败，请稍后重试。'
+      error.value = err.message ? rawMessage(err.message) : message('auth.code.failed')
       // 后端说还在冷却里：它知道精确的剩余秒数（本地这份可能因为换标签页而丢了），
       // 但那个秒数只在 message 里。与其去解析文案，不如把按钮重新放开——
       // 用户再点一次就会再次看到剩余时间，不会出现「按钮灰着但不说为什么」
@@ -100,7 +111,7 @@ export function useVerifyCode(purpose) {
 
   onBeforeUnmount(stopTimer)
 
-  return { email, sending, countdown, note, error, send, restoreCountdown }
+  return { email, sending, countdown, note, noteText, error, errorText, send, restoreCountdown }
 }
 
 /* ------------------------------------------------------------------ 内部 */

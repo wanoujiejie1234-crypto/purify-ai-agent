@@ -110,7 +110,7 @@ public class KnowledgeBaseController {
                                         @RequestParam String classification,
                                         @RequestParam(required = false) List<String> classifications) {
         if (files == null || files.isEmpty()) {
-            throw ApiException.unsupportedDocument("请至少上传一个文件");
+            throw ApiException.unsupportedDocument("error.kb.noFiles");
         }
         List<String> perFile = resolveClassifications(files.size(), classification, classifications);
 
@@ -149,7 +149,7 @@ public class KnowledgeBaseController {
     public ChunkPreview preview(@RequestParam("file") MultipartFile file,
                                 @RequestParam String classification) {
         if (file == null || file.isEmpty()) {
-            throw ApiException.unsupportedDocument("请上传一个非空的文件");
+            throw ApiException.unsupportedDocument("error.kb.emptyFile");
         }
         return indexService.preview(file.getOriginalFilename(), file.getResource(), classification);
     }
@@ -201,9 +201,7 @@ public class KnowledgeBaseController {
             return classifications;
         }
         // 其余数量对不上就是调用方的 bug。与其猜它想怎么配，不如直接报出来
-        throw ApiException.unsupportedDocument(
-                "classifications 有 " + classifications.size() + " 个，但只有 " + fileCount
-                        + " 份文件：两者要么一一对应，要么只给一个整批共用");
+        throw ApiException.unsupportedDocument("error.kb.classificationCountMismatch", classifications.size(), fileCount);
     }
 
     /**
@@ -215,13 +213,11 @@ public class KnowledgeBaseController {
      */
     private DocumentIndexResult uploadOne(MultipartFile file, String classification) {
         if (file == null || file.isEmpty()) {
-            throw ApiException.unsupportedDocument("请上传一个非空的文件");
+            throw ApiException.unsupportedDocument("error.kb.emptyFile");
         }
         long maxFileSize = pgVectorProperties.getMaxFileSize();
         if (file.getSize() > maxFileSize) {
-            throw ApiException.unsupportedDocument(
-                    "文件 " + file.getSize() + " 字节，超过上限 " + maxFileSize + " 字节（"
-                            + (maxFileSize / 1024) + "KB）。请拆分后分几次上传。");
+            throw ApiException.unsupportedDocument("error.kb.fileTooLarge", file.getSize(), maxFileSize, maxFileSize / 1024);
         }
         return indexService.index(file.getOriginalFilename(), file.getResource(), classification);
     }

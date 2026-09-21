@@ -23,8 +23,7 @@ public record SendCodeRequest(String email, String purpose) {
     public VerificationPurpose requirePurpose() {
         VerificationPurpose parsed = VerificationPurpose.parse(purpose);
         if (parsed == null) {
-            throw ApiException.authInvalid(
-                    "未知的用途「" + purpose + "」，只支持 REGISTER 或 RESET_PASSWORD");
+            throw ApiException.authInvalid("error.auth.unknownPurpose", purpose);
         }
         return parsed;
     }

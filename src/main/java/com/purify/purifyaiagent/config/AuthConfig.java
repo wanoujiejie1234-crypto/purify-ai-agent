@@ -2,6 +2,7 @@ package com.purify.purifyaiagent.config;
 
 import com.purify.purifyaiagent.auth.AuthInterceptor;
 import com.purify.purifyaiagent.auth.AuthService;
+import com.purify.purifyaiagent.auth.AvatarStorage;
 import com.purify.purifyaiagent.auth.EmailSender;
 import com.purify.purifyaiagent.auth.JwtService;
 import com.purify.purifyaiagent.auth.RootAgentInitializer;
@@ -9,6 +10,7 @@ import com.purify.purifyaiagent.auth.SchemaGuard;
 import com.purify.purifyaiagent.auth.UserRepository;
 import com.purify.purifyaiagent.auth.VerifyCodeRepository;
 import com.purify.purifyaiagent.auth.VerifyCodeService;
+import com.purify.purifyaiagent.i18n.MessageResolver;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -42,6 +44,15 @@ public class AuthConfig {
     @Bean
     public UserRepository userRepository(JdbcTemplate jdbcTemplate) {
         return new UserRepository(jdbcTemplate);
+    }
+
+    /**
+     * 头像的落盘。目录和对外地址都由它自己管，见 {@link AvatarStorage}——
+     * 存本地而不是传 OSS 的理由也写在那里。
+     */
+    @Bean
+    public AvatarStorage avatarStorage() {
+        return new AvatarStorage();
     }
 
     @Bean
@@ -87,8 +98,9 @@ public class AuthConfig {
      */
     @Bean
     public EmailSender emailSender(ObjectProvider<JavaMailSender> mailSenderProvider,
-                                   AuthProperties authProperties) {
-        return new EmailSender(mailSenderProvider, authProperties);
+                                   AuthProperties authProperties,
+                                   MessageResolver messageResolver) {
+        return new EmailSender(mailSenderProvider, authProperties, messageResolver);
     }
 
     @Bean

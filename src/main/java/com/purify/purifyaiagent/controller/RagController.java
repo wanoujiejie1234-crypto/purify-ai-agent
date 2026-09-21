@@ -68,7 +68,7 @@ public class RagController {
     @GetMapping("/search")
     public RagSearchResult search(@RequestParam("q") String question) {
         if (!StringUtils.hasText(question)) {
-            throw ApiException.invalidChatRequest("q（要检索的问题）不能为空");
+            throw ApiException.invalidChatRequest("error.rag.queryRequired");
         }
 
         KnowledgeSearch.Result result = knowledgeSearch.search(question);

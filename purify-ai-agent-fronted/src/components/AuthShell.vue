@@ -33,7 +33,7 @@ defineProps({
         <span class="mark"><AppIcon name="drop" /></span>
         <span class="brand-name">Purify AI</span>
       </RouterLink>
-      <RouterLink to="/" class="back">返回首页</RouterLink>
+      <RouterLink to="/" class="back">{{ $t('auth.shellBack') }}</RouterLink>
     </header>
 
     <main class="panel">

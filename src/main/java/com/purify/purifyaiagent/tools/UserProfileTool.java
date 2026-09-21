@@ -1,17 +1,15 @@
 package com.purify.purifyaiagent.tools;
 
+import com.purify.purifyaiagent.agent.tool.ToolContexts;
 import com.purify.purifyaiagent.model.ActivityLevel;
 import com.purify.purifyaiagent.model.UserProfile;
-import com.purify.purifyaiagent.profile.UserProfileRepository;
+import com.purify.purifyaiagent.profile.ProfileService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.model.ToolContext;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
-import org.springframework.util.StringUtils;
 
-import java.time.LocalDateTime;
 import java.util.List;
-import java.util.Optional;
 
 /**
  * 用户画像工具：让「轻语」记得住这个人的基本情况，并且跨会话留得住。
@@ -26,7 +24,7 @@ import java.util.Optional;
  * <p><b>用户是谁，不归模型管。</b>两个方法都带一个 {@link ToolContext} 参数，
  * 而 Spring AI 会把它从工具的 JSON Schema 里摘掉——也就是说模型既看不到它，也传不了它。
  * 值由 {@code SlimApp} 在发起请求时通过 {@code .toolContext(...)} 塞进去，
- * 键是 {@link #USER_ID_KEY}。这样做是必须的：如果把 userId 做成普通参数交给模型填，
+ * 键是 {@link ToolContexts#USER_ID_KEY}。这样做是必须的：如果把 userId 做成普通参数交给模型填，
  * 模型会照着自己编一个，用户这次存进去的画像下次就找不回来了。
  *
  * <p>由此带来一条硬性约束：<b>调用挂了本工具的 ChatClient 时，必须每次都带上 toolContext</b>。
@@ -39,24 +37,23 @@ import java.util.Optional;
  * （{@code chatId}），代价是「换一个会话就等于换了一个人」——同一个用户在轻语里说过的
  * 身高体重，新开一个会话就查不到了。现在画像真正按人存，跨会话、跨链路都读得到。
  *
- * <p>这个类本身对这次切换<b>一个字都没改</b>：它一直只认 {@link #USER_ID_KEY} 这个键，
+ * <p>这个类本身对这次切换<b>一个字都没改</b>：它一直只认 {@link ToolContexts#USER_ID_KEY} 这个键，
  * 值从哪里来是外面的事。这正是当初把用户标识做成工具上下文而不是模型参数的回报。
  */
 @Slf4j
 public class UserProfileTool {
 
     /**
-     * 从 {@link ToolContext} 里取用户标识用的键。
+     * 读写都走 {@link ProfileService}，不直接碰仓储。
      *
-     * <p>公开出来是为了让 {@code SlimApp} 直接引用它去填值，而不是在两边各写一遍字符串——
-     * 这种键一旦拼错，表现是「画像永远读不到」，而且不报任何错，很难查。
+     * <p>设置页那条路径（{@code ProfileController}）用的是同一个 service——
+     * 「先读再合并」「体重变了才记流水」这些规则只写一遍，
+     * 两个入口才不会慢慢走偏。
      */
-    public static final String USER_ID_KEY = "userId";
+    private final ProfileService profileService;
 
-    private final UserProfileRepository repository;
-
-    public UserProfileTool(UserProfileRepository repository) {
-        this.repository = repository;
+    public UserProfileTool(ProfileService profileService) {
+        this.profileService = profileService;
     }
 
     /**
@@ -76,15 +73,14 @@ public class UserProfileTool {
             return "读取用户画像失败：" + missingUserId();
         }
 
-        Optional<UserProfile> found = repository.find(userId);
-        if (found.isEmpty()) {
+        UserProfile profile = profileService.read(userId);
+        if (profile.isBlank()) {
             log.debug("[UserProfileTool] userId={} 还没有画像", userId);
-            // 画像不存在时不去查流水，省一次必然为空的查询
-            return UserProfile.empty().describe(List.of());
+            // 画像还是空的就别去查流水了，省一次必然为空的查询
+            return profile.describe(List.of());
         }
 
-        UserProfile profile = found.get();
-        List<UserProfile.WeightRecord> history = repository.findWeightHistory(userId);
+        List<UserProfile.WeightRecord> history = profileService.history(userId);
         log.debug("[UserProfileTool] userId={} 读到画像，体重流水 {} 条", userId, history.size());
         return profile.describe(history);
     }
@@ -121,46 +117,36 @@ public class UserProfileTool {
             return "保存用户画像失败：" + missingUserId();
         }
 
-        LocalDateTime now = LocalDateTime.now();
+        // updatedAt 传 null：时间戳由 ProfileService 在写库那一刻统一盖，
+        // 调用方传什么都会被覆盖——在这里写 now() 只会让人以为它有用
         UserProfile incoming = new UserProfile(age, heightCm, weightKg, goal,
-                activityLevel, dietPreference, avoidFood, now);
+                activityLevel, dietPreference, avoidFood, null);
         if (incoming.isBlank()) {
             return "这次没有传来任何可以保存的字段，画像保持不变。"
                     + "如果只是想看一下用户的情况，用 getUserProfile。";
         }
 
-        UserProfile existing = repository.find(userId).orElseGet(UserProfile::empty);
-        UserProfile merged = existing.merge(incoming);
-        repository.save(userId, merged);
+        // 合并、记流水这两件事在 service 里，和设置页那条路径共用同一份实现
+        UserProfile merged = profileService.update(userId, incoming);
 
-        // 记流水的前提是「体重确实变了」：模型经常把已知的体重再传一遍，
-        // 逐次照记的话，流水会迅速被同一个数字淹没，趋势也就看不出来了
-        boolean weightChanged = weightKg != null
-                && (existing.weightKg() == null || Double.compare(existing.weightKg(), weightKg) != 0);
-        if (weightChanged) {
-            repository.appendWeight(userId, weightKg, now);
-            log.info("[UserProfileTool] userId={} 体重 {} kg → {} kg，已记入体重历史",
-                    userId, existing.weightKg(), weightKg);
-        }
-        log.info("[UserProfileTool] userId={} 画像已更新", userId);
-
-        return "已保存。当前画像：\n" + merged.describe(repository.findWeightHistory(userId));
+        return "已保存。当前画像：\n" + merged.describe(profileService.history(userId));
     }
 
     /**
      * 从工具上下文里取用户标识，取不到返回 {@code null}。
      *
-     * <p>只在两端都出问题时才会走到：一是 SlimApp 忘了设 toolContext（那会在更早的地方
-     * 被 Spring AI 拦下并抛异常），二是设了但键对不上。后一种正是拼错字符串的典型症状，
-     * 所以这里返回一句话让模型转告用户，比抛一个栈要好排查得多。
+     * <p>取值逻辑搬到了 {@link ToolContexts#userIdOf}，和资料库那几个工具共用一份。
+     * 键名收在一个类里，「拼错了字符串」这种不报错、只表现为「画像永远读不到」的问题
+     * 才算有了根除的地方。
+     *
+     * <p>取不到时返回一句话让模型转告用户，比抛一个栈要好排查得多。
      */
     private static String userIdOf(ToolContext toolContext) {
-        Object value = toolContext == null ? null : toolContext.getContext().get(USER_ID_KEY);
-        if (value == null || !StringUtils.hasText(value.toString())) {
-            log.warn("[UserProfileTool] 工具上下文里没有 {}，无法确定这是哪位用户", USER_ID_KEY);
-            return null;
+        String userId = ToolContexts.userIdOf(toolContext);
+        if (userId == null) {
+            log.warn("[UserProfileTool] 工具上下文里没有 {}，无法确定这是哪位用户", ToolContexts.USER_ID_KEY);
         }
-        return value.toString();
+        return userId;
     }
 
     private static String missingUserId() {

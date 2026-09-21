@@ -9,6 +9,8 @@ import com.purify.purifyaiagent.chat.ChatEntry;
 import com.purify.purifyaiagent.chat.ChatRecordRepository;
 import com.purify.purifyaiagent.chat.ChatSessionRepository;
 import com.purify.purifyaiagent.chat.SessionAccess;
+import com.purify.purifyaiagent.i18n.MessageResolver;
+import com.purify.purifyaiagent.i18n.Messages;
 import com.purify.purifyaiagent.model.ChatHistoryItem;
 import com.purify.purifyaiagent.model.ChatRequest;
 import lombok.extern.slf4j.Slf4j;
@@ -55,13 +57,16 @@ public class PurifyManusController {
     private final PurifyManus manus;
     private final ChatRecordRepository chatRecordRepository;
     private final ChatSessionRepository chatSessionRepository;
+    private final MessageResolver messageResolver;
 
     public PurifyManusController(PurifyManus manus,
                                  ChatRecordRepository chatRecordRepository,
-                                 ChatSessionRepository chatSessionRepository) {
+                                 ChatSessionRepository chatSessionRepository,
+                                 MessageResolver messageResolver) {
         this.manus = manus;
         this.chatRecordRepository = chatRecordRepository;
         this.chatSessionRepository = chatSessionRepository;
+        this.messageResolver = messageResolver;
     }
 
     /**
@@ -94,10 +99,14 @@ public class PurifyManusController {
         // 智能体自己会把模型和工具的错误转成 ERROR 事件；能走到这里的只有传输层的意外
         // （客户端断开、编码失败）。留一条兜底，免得用户看到一个没有事件、也没有结尾的流，
         // 分不清是还在跑还是已经断了
-        Flux<AgentEvent> events = manus.chatStream(id, me.id(), message)
+        // 语言在**请求线程上**取一次再往下带：流里的算子跑在 Reactor 线程上，
+        // 那时候 LocaleContextHolder 已经不准了（见 i18n/Messages）
+        Messages i18n = messageResolver.current();
+        Flux<AgentEvent> events = manus.chatStream(id, me.id(), i18n, message)
                 .onErrorResume(error -> {
                     log.error("[manus] 流式对话失败 chatId={}", id, error);
-                    return Flux.just(AgentEvent.error("服务暂时出了点问题，请稍后再试。"));
+                    // 这里也用的是上面捕获好的 i18n，不是现取
+                    return Flux.just(AgentEvent.error(i18n.get("error.streamFailed")));
                 });
 
         return SseEvents.response(id, events);
