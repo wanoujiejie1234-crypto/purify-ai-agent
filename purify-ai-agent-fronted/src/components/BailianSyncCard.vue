@@ -6,6 +6,7 @@ import {
   fetchBailianChunks,
   syncBailianDocuments,
 } from '../api/http.js'
+import { MAX_CUSTOM_LENGTH, OTHER, resolveCategory } from '../knowledgeCategory.js'
 import { isEnglish, message, rawMessage, resolveMessage, t } from '../i18n/index.js'
 
 /**
@@ -21,6 +22,10 @@ import { isEnglish, message, rawMessage, resolveMessage, t } from '../i18n/index
  *   1. **一次只展开一份文档的切片**，展开新的就收起旧的；
  *   2. 列表页**不显示「百炼侧有多少片」**——那个数要逐份调切片接口才拿得到，
  *      一页十行就是十次远程请求，只为在表格里显示一个数字。
+ *
+ * <p>分类那一栏和本地上传那边一样有「其他…」：从百炼搬一份文档进来时，
+ * 顺手就能给它起一个新分类，不必先回上传卡片传一份同类型的东西把分类「造」出来。
+ * 哨兵值和取值规则共用 `knowledgeCategory.js`。
  */
 
 const emit = defineEmits(['synced'])
@@ -36,8 +41,11 @@ const statusErrorText = computed(() => resolveMessage(statusError.value))
 
 /**
  * 可选分类来自后端的 status 接口，**不在前端硬编码**。
- * 这些值必须和 purify.rag.router.categories 一字不差——写错了检索查不到任何东西
+ * 这些值必须和写入端、检索端一字不差——写错了检索查不到任何东西
  * 而且不报任何错，所以能少一处硬编码就少一处。
+ *
+ * 里面既有 yml 里内置的那几项，也有用户自建的类型（后端从切片元数据里发现的），
+ * 所以同步一份文档时可以直接挑一个已经建好的自建分类。
  */
 const categories = computed(() => status.value?.categories || [])
 
@@ -148,8 +156,36 @@ const chunkTotalPages = computed(() =>
  *
  * 百炼的元数据里标了分类就用它，没标（或标了多个）就得由人来选——
  * 不猜。分类值错了会让这些切片在带分类过滤的提问下永远检索不到，而且不报任何错。
+ *
+ * 值可能是 {@link OTHER}（下拉里选了「其他…」），这时真正的分类名在手填的
+ * {@link customChosen} 里——**按下标取，不要直接读这个 map**，见 {@link chosenValue}。
  */
 const chosen = ref({})
+
+/**
+ * 选了「其他…」的那几份，各自手填的类型名。
+ *
+ * 按 fileId 存而不是只存一份：一次只展开一份文档，但**批量同步会一次发好几份**
+ * （每份各自展开选过一次），只留一份的话后填的会把先填的盖掉，
+ * 表现是「两份文档都进了同一个分类」，而且不报任何错。
+ */
+const customChosen = ref({})
+
+/**
+ * 某一份文档最终要发出去的分类值。
+ *
+ * 校验和发请求**都必须走这一个函数**：两处各判各的会出现「校验通过了，
+ * 发出去的却是 `__other__` 这个哨兵」——后端会把它当合法分类收下，于是库里多出
+ * 一个叫 `__other__` 的分类，什么都不报。规则和本地上传那边共用，见 knowledgeCategory.js。
+ */
+function chosenValue(fileId) {
+  return resolveCategory(chosen.value[fileId], customChosen.value[fileId])
+}
+
+/** 列表里那几个名字拼成一句给人看的话。分隔符跟着语言走，三种提示共用。 */
+function namesOf(list) {
+  return list.map((d) => d.name).join(isEnglish() ? ', ' : '、')
+}
 
 const expandedDoc = computed(() => docs.value.find((d) => d.fileId === expandedId.value) || null)
 
@@ -230,19 +266,31 @@ function pickSelected() {
     return null
   }
   // 分类必须先齐了再发请求。服务端的表现是「逐份失败」，用户会看到一堆失败项
-  // 却不知道要去哪改；在这里拦下来就能把问题指到具体哪几行
-  const missing = picked.filter((d) => !chosen.value[d.fileId])
-  if (missing.length) {
-    syncErrors.value = [message('knowledge.bailian.needCategory', {
-      names: missing.map((d) => d.name).join(isEnglish() ? ', ' : '、'),
-    })]
+  // 却不知道要去哪改；在这里拦下来就能把问题指到具体哪几行。
+  // 判断用的是 chosenValue（选了「其他…」时看手填那段），不是直接读 chosen——
+  // 只读 chosen 的话，选了「其他…」却没填名字的那几份会被当成「已经选好了」
+  const unresolved = picked.filter((d) => !chosenValue(d.fileId))
+  if (unresolved.length) {
+    // 「压根没选」和「选了其他但没填名字」要分开说：后者的用户去下拉框里找是找不到问题的，
+    // 他明明选了。两类都有就两条都给，syncErrors 本来就是一组
+    syncErrors.value = []
+    const blankCustom = unresolved.filter((d) => chosen.value[d.fileId] === OTHER)
+    if (blankCustom.length) {
+      syncErrors.value.push(
+        message('knowledge.bailian.needCustomName', { names: namesOf(blankCustom) }),
+      )
+    }
+    const unpicked = unresolved.filter((d) => chosen.value[d.fileId] !== OTHER)
+    if (unpicked.length) {
+      syncErrors.value.push(message('knowledge.bailian.needCategory', { names: namesOf(unpicked) }))
+    }
     return null
   }
   // 同名冲突会覆盖本地那份手传的切片，是这批操作里唯一有破坏性的，
   // 所以单独问一次；其余状态直接往下走
   const conflicts = picked.filter((d) => d.syncState === 'NAME_CONFLICT')
   if (conflicts.length) {
-    const names = conflicts.map((d) => d.name).join(isEnglish() ? ', ' : '、')
+    const names = namesOf(conflicts)
     const confirmKey = conflicts.length === 1
       ? 'knowledge.bailian.conflictConfirm'
       : 'knowledge.bailian.conflictConfirmBatch'
@@ -266,7 +314,10 @@ async function sync(items) {
       message('knowledge.bailian.result.failureItem', { name: i.filename, message: i.message }),
     )
     emit('synced')
-    await loadDocuments()
+    // status 也要重拉：这一次同步可能刚用「其他…」建了一个新分类，
+    // 而可选分类是从 status 里来的。不重拉的话，用户在下拉框里看不到自己刚建的那一类，
+    // 也没法用它去标下一份文档
+    await Promise.all([loadStatus(), loadDocuments()])
   } catch (err) {
     syncErrors.value = [err.message ? rawMessage(err.message) : message('knowledge.bailian.result.failed')]
   } finally {
@@ -283,8 +334,15 @@ async function syncSelected() {
 async function syncOne() {
   const doc = expandedDoc.value
   if (!doc) return
-  if (!chosen.value[doc.fileId]) {
-    syncErrors.value = [message('knowledge.bailian.needCategory', { names: doc.name })]
+  if (!chosenValue(doc.fileId)) {
+    syncErrors.value = [
+      message(
+        chosen.value[doc.fileId] === OTHER
+          ? 'knowledge.bailian.needCustomName'
+          : 'knowledge.bailian.needCategory',
+        { names: doc.name },
+      ),
+    ]
     return
   }
   if (doc.syncState === 'NAME_CONFLICT') {
@@ -296,6 +354,9 @@ async function syncOne() {
 /**
  * 转成请求体。
  *
+ * `classification` 用的是 {@link chosenValue} —— 它是**兜底值**：百炼元数据里已经标了
+ * 一个认识的分类时，服务端以元数据为准（那正是「百炼标清楚了」的意思）。
+ *
  * `gmtModified` 必须带上：服务端会把它存进切片元数据，日后拿它和百炼当前值比对，
  * 判断「那边改过没有」。不带的话这份文档会一直显示「百炼侧已更新」——本地没有基准可比，
  * 顶多多同步一次，不会出错，但没必要让它退化。
@@ -304,7 +365,7 @@ function toItem(doc) {
   return {
     fileId: doc.fileId,
     name: doc.name,
-    classification: chosen.value[doc.fileId],
+    classification: chosenValue(doc.fileId),
     gmtModified: doc.gmtModified,
   }
 }
@@ -433,13 +494,37 @@ onMounted(reload)
                   : $t('knowledge.bailian.chunks.needPick')
               }}
             </p>
-            <label class="field">
-              {{ $t('knowledge.bailian.chunks.category') }}
-              <select v-model="chosen[expandedDoc.fileId]">
-                <option value=""></option>
-                <option v-for="c in categories" :key="c" :value="c">{{ c }}</option>
-              </select>
-            </label>
+            <div class="pick-row">
+              <label class="field">
+                {{ $t('knowledge.bailian.chunks.category') }}
+                <select v-model="chosen[expandedDoc.fileId]">
+                  <option value=""></option>
+                  <option v-for="c in categories" :key="c" :value="c">{{ c }}</option>
+                  <!-- 和本地上传那边同一套：哨兵值来自 knowledgeCategory.js，
+                       选中它才出现右边那个输入框。有了它，从百炼搬一份文档时
+                       顺手就能建一个新分类，不必先回上传卡片「造」一个出来 -->
+                  <option :value="OTHER">{{ $t('knowledge.bailian.chunks.categoryOther') }}</option>
+                </select>
+              </label>
+
+              <!-- 类型名是自由文本，所以长度和字符都有限制（后端会再校验一遍，
+                   超了直接 400）；这里先拦长度，让用户不用等一次往返 -->
+              <label v-if="chosen[expandedDoc.fileId] === OTHER" class="field">
+                {{ $t('knowledge.bailian.chunks.categoryCustomLabel') }}
+                <input
+                  v-model="customChosen[expandedDoc.fileId]"
+                  type="text"
+                  :maxlength="MAX_CUSTOM_LENGTH"
+                  :placeholder="$t('knowledge.bailian.chunks.categoryCustomPlaceholder')"
+                />
+              </label>
+            </div>
+
+            <!-- 新分类的两条代价说在前面：它会成为一个独立分类；路由是纯字符串匹配，
+                 提问里得出现这个名字才会按它过滤 -->
+            <p v-if="chosen[expandedDoc.fileId] === OTHER" class="hint">
+              {{ $t('knowledge.bailian.chunks.categoryCustomHint') }}
+            </p>
           </div>
 
           <p v-if="!chunks.chunks?.length" class="warn">
@@ -556,6 +641,22 @@ onMounted(reload)
   font: inherit;
   font-size: 13px;
   color: var(--ink);
+}
+/* 自建类型的输入框。宽度写死一点：它和 select 并排，跟着内容伸缩会让这一行跳来跳去 */
+.field input[type='text'] {
+  width: 150px;
+  padding: 6px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink);
+  outline: none;
+}
+.field input[type='text']:focus {
+  border-color: #10a37f;
+  box-shadow: 0 0 0 3px #10a37f1f;
 }
 
 .btn {
@@ -706,6 +807,23 @@ onMounted(reload)
 }
 .pick .warn {
   margin-bottom: 8px;
+}
+
+/* 分类下拉 + 「其他…」时冒出来的输入框。两个都是 inline-flex 的 label，
+   包一层是为了换行时它们一起走，而不是一个掉到下一行、一个留在上面 */
+.pick-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/* 「其他…」的说明。不是报错，所以不用 .warn 的黄 —— 它讲的是这个类型会被怎么用 */
+.hint {
+  margin-top: 8px;
+  color: #6b7381;
+  font-size: 12.5px;
+  line-height: 1.7;
 }
 
 .chunks {

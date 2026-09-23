@@ -7,6 +7,7 @@ import com.alibaba.cloud.ai.dashscope.rerank.DashScopeRerankModel;
 import com.alibaba.cloud.ai.dashscope.rerank.DashScopeRerankOptions;
 import com.alibaba.cloud.ai.model.RerankModel;
 import com.purify.purifyaiagent.rag.KnowledgeBaseAdvisor;
+import com.purify.purifyaiagent.rag.KnowledgeCategories;
 import com.purify.purifyaiagent.rag.KnowledgeRouter;
 import com.purify.purifyaiagent.rag.RagPrompts;
 import com.purify.purifyaiagent.rag.pgvector.DashScopeEmbeddingBatchingStrategy;
@@ -16,6 +17,7 @@ import com.purify.purifyaiagent.rag.pgvector.PgKeywordSearcher;
 import com.purify.purifyaiagent.rag.pgvector.PgVectorDocumentRetriever;
 import com.purify.purifyaiagent.rag.pgvector.PgVectorIndexService;
 import com.purify.purifyaiagent.rag.pgvector.PgVectorKnowledgeBaseAdvisor;
+import com.purify.purifyaiagent.rag.pgvector.PgVectorKnowledgeCategories;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import lombok.extern.slf4j.Slf4j;
@@ -269,6 +271,27 @@ public class PgVectorRagConfig {
     }
 
     /**
+     * 分类目录：yml 里内置的那几项 <b>∪ 库里已经用过的值</b>。
+     *
+     * <p>「库里已经用过的值」就是用户在管理页上选「其他…」自己填的那些类型名。
+     * 没有这一层的话，那些分类只有上传端认识、检索端不认识——文档进得去，
+     * 却永远不会被检索到，而且不报任何错。完整论证见
+     * {@link PgVectorKnowledgeCategories} 的类注释。
+     *
+     * <p>这里显式接 {@link PgVectorJdbc} 再取它的 {@code jdbcTemplate()}：本类的类注释里
+     * 那条「铁律」讲得很清楚，按类型注入 {@code JdbcTemplate} 拿到的一定是 MySQL 那个。
+     *
+     * <p><b>Bean 名与百炼链路那个刻意一致</b>（{@code knowledgeCategories}），
+     * 理由同下面两个 Bean：两条链路的装配条件在类级互斥，容器里永远只有一个。
+     */
+    @Bean
+    public KnowledgeCategories knowledgeCategories(RagProperties ragProperties,
+                                                   PgVectorProperties pgVectorProperties,
+                                                   PgVectorJdbc pgVectorJdbc) {
+        return new PgVectorKnowledgeCategories(ragProperties, pgVectorProperties, pgVectorJdbc.jdbcTemplate());
+    }
+
+    /**
      * 检索器：分类过滤 + 向量粗排 + 关键词检索 + RRF 融合 + Rank 模型精排。
      *
      * <p>关键词那一路用 {@code ObjectProvider} 取：没装配时整条链路退化成纯向量检索，
@@ -280,10 +303,12 @@ public class PgVectorRagConfig {
     @Bean
     public DocumentRetriever knowledgeBaseDocumentRetriever(VectorStore pgVectorStore,
                                                             RagProperties ragProperties,
+                                                            KnowledgeCategories knowledgeCategories,
                                                             PgVectorProperties pgVectorProperties,
                                                             ObjectProvider<RerankModel> ragRerankModel,
                                                             ObjectProvider<PgKeywordSearcher> keywordSearcher) {
-        return new PgVectorDocumentRetriever(pgVectorStore, ragProperties, pgVectorProperties,
+        return new PgVectorDocumentRetriever(pgVectorStore, ragProperties, knowledgeCategories,
+                pgVectorProperties,
                 // 关掉 enable-reranking 时容器里没有这个 Bean，检索退化成只做向量粗排
                 ragRerankModel.getIfAvailable(),
                 keywordSearcher.getIfAvailable());
@@ -327,8 +352,9 @@ public class PgVectorRagConfig {
     public PgVectorIndexService pgVectorIndexService(VectorStore pgVectorStore,
                                                      PgVectorJdbc pgVectorJdbc,
                                                      PgVectorProperties pgVectorProperties,
-                                                     RagProperties ragProperties) {
+                                                     RagProperties ragProperties,
+                                                     KnowledgeCategories knowledgeCategories) {
         return new PgVectorIndexService(pgVectorStore, pgVectorJdbc.jdbcTemplate(),
-                pgVectorProperties, ragProperties);
+                pgVectorProperties, ragProperties, knowledgeCategories);
     }
 }

@@ -4,10 +4,12 @@ import com.alibaba.cloud.ai.dashscope.api.DashScopeApi;
 import com.alibaba.cloud.ai.dashscope.rag.DashScopeDocumentRetriever;
 import com.alibaba.cloud.ai.dashscope.rag.DashScopeDocumentRetrieverOptions;
 import com.purify.purifyaiagent.rag.KnowledgeBaseAdvisor;
+import com.purify.purifyaiagent.rag.KnowledgeCategories;
 import com.purify.purifyaiagent.rag.KnowledgeRouter;
 import com.purify.purifyaiagent.rag.RagPrompts;
 import com.purify.purifyaiagent.rag.RoutingDocumentRetriever;
 import com.purify.purifyaiagent.rag.RoutingKnowledgeBaseAdvisor;
+import com.purify.purifyaiagent.rag.StaticKnowledgeCategories;
 import org.springframework.ai.rag.retrieval.search.DocumentRetriever;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
@@ -49,6 +51,19 @@ import java.util.Map;
 @ConditionalOnProperty(prefix = RagStore.PREFIX, name = "store",
         havingValue = RagStore.BAILIAN, matchIfMissing = true)
 public class RagConfig {
+
+    /**
+     * 分类目录。百炼链路上只有 yml 里那一份——切片在云端，本地没有一张能查出
+     * 「已经用过哪些分类」的表，写入端也不在本项目里（文档和控制台里的打标都在百炼侧）。
+     * 详见 {@link StaticKnowledgeCategories} 的类注释。
+     *
+     * <p><b>Bean 名与 pgvector 链路那个刻意一致</b>（{@code knowledgeCategories}），
+     * 理由同下面两个 Bean：两条链路的装配条件在类级互斥，容器里永远只有一个。
+     */
+    @Bean
+    public KnowledgeCategories knowledgeCategories(RagProperties ragProperties) {
+        return new StaticKnowledgeCategories(ragProperties);
+    }
 
     /**
      * 知识库检索器。

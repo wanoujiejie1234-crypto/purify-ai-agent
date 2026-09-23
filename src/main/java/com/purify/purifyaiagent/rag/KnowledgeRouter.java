@@ -10,15 +10,19 @@ import java.util.List;
 /**
  * 检索路由：先判断「这个问题要不要查知识库、该查哪一类」，再决定发不发检索请求。
  *
- * <p><b>为什么需要它</b>：知识库里的切片用元数据 {@code classification} 分成了
- * 食物热量 / 运动热量 / 药物三类，但检索接口默认是把整个库一起捞的——
- * 每问一句「你好」都要跑一次向量召回加一次重排序模型调用，纯属浪费。
- * 有了路由，闲聊、寒暄、与瘦身无关的问题压根不发起检索；只涉及一类的问题
- * 则带上过滤条件，只捞这一类。
+ * <p><b>为什么需要它</b>：知识库里的切片用元数据 {@code classification} 分成几类，
+ * 但检索接口默认是把整个库一起捞的——每问一句「你好」都要跑一次向量召回加一次
+ * 重排序模型调用，纯属浪费。有了路由，闲聊、寒暄、与知识库无关的问题压根不发起检索；
+ * 只涉及一类的问题则带上过滤条件，只捞这一类。
  *
  * <p>判定方式是<b>纯字符串匹配</b>，不调模型、不产生任何远程开销——
  * 如果为了省一次检索而先花一次模型调用去分类，那就本末倒置了。
- * 关键词表放在 yml（{@code purify.rag.router.categories}）里，随时可改，不用重新打包。
+ *
+ * <p>关键词表有两个来源，都从 {@link KnowledgeCategories} 拿：yml 里的
+ * {@code purify.rag.router.categories}（带一份正经的关键词表），
+ * 以及用户在管理页上自建的类型（关键词就是类型名本身）。
+ * 后者的取舍写在 {@code PgVectorKnowledgeCategories#categoryOf} 上——
+ * 简单说：提问里得出现那个类型名，它才会被路由到。
  *
  * <p>这个类只做判定，不做检索：具体怎么按分类过滤由 {@link RoutingDocumentRetriever} 负责。
  */
@@ -35,8 +39,11 @@ public class KnowledgeRouter {
 
     private final RagProperties ragProperties;
 
-    public KnowledgeRouter(RagProperties ragProperties) {
+    private final KnowledgeCategories knowledgeCategories;
+
+    public KnowledgeRouter(RagProperties ragProperties, KnowledgeCategories knowledgeCategories) {
         this.ragProperties = ragProperties;
+        this.knowledgeCategories = knowledgeCategories;
     }
 
     /**
@@ -46,7 +53,7 @@ public class KnowledgeRouter {
      * @return 见 {@link Decision}；永远不会返回 {@code null}
      */
     public Decision route(String question) {
-        List<RagProperties.Category> categories = ragProperties.getRouter().getCategories();
+        List<RagProperties.Category> categories = knowledgeCategories.all();
 
         if (categories.isEmpty()) {
             // 没配分类表就退回「不带过滤查全库」，而不是不查——

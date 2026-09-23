@@ -1,6 +1,7 @@
 package com.purify.purifyaiagent.rag.pgvector;
 
 import com.purify.purifyaiagent.config.RagProperties;
+import com.purify.purifyaiagent.rag.KnowledgeCategories;
 import com.purify.purifyaiagent.rag.KnowledgeRouter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.rag.Query;
@@ -39,7 +40,7 @@ public record ClassificationFilter(@Nullable String field, @Nullable String valu
     }
 
     /**
-     * 由「这次检索的 Query + 路由配置」判定该不该带分类过滤。
+     * 由「这次检索的 Query + 分类目录」判定该不该带分类过滤。
      *
      * <p>判定规约（这一段整体搬自原来的 {@code PgVectorDocumentRetriever#buildFilter}，
      * 注释一并带过来）：
@@ -49,23 +50,25 @@ public record ClassificationFilter(@Nullable String field, @Nullable String valu
      *       一个字段的一个值过滤（等值查询不支持一个字段配多个值）。
      *       退化成全库虽然多带了点无关切片，但重排那一关会把它们压下去，
      *       代价远小于「为多分类再发一次请求」。</li>
-     *   <li><b>分类名不在配置表里时不带过滤。</b>它来自路由的关键词表，而过滤用的
+     *   <li><b>分类名不在分类目录里时不带过滤。</b>它来自路由的关键词表，而过滤用的
      *       字段名与取值必须和写入端一致；对不上时直接查全库，而不是拿一个查不到
      *       东西的条件去查——否则表现是「知识库突然什么都检索不到」，
-     *       比多带点无关切片难查得多。</li>
+     *       比多带点无关切片难查得多。
+     *       注意「目录」不只是 yml 里那几项：用户自建的类型也在里面
+     *       （见 {@code KnowledgeCategories}），所以自建类型这一步不会误判成未知。</li>
      * </ul>
      */
-    public static ClassificationFilter decide(Query query, RagProperties ragProperties) {
+    public static ClassificationFilter decide(Query query,
+                                              KnowledgeCategories knowledgeCategories,
+                                              RagProperties ragProperties) {
         Object raw = query.context().get(KnowledgeRouter.CATEGORIES_KEY);
         if (!(raw instanceof List<?> categories) || categories.size() != 1) {
             return none();
         }
 
         String category = String.valueOf(categories.get(0));
-        boolean known = ragProperties.getRouter().getCategories().stream()
-                .anyMatch(item -> category.equals(item.getValue()));
-        if (!known) {
-            log.warn("[pgvector] 配置里没有分类「{}」，退回全库检索", category);
+        if (!knowledgeCategories.isKnown(category)) {
+            log.warn("[pgvector] 分类目录里没有分类「{}」，退回全库检索", category);
             return none();
         }
 

@@ -255,6 +255,21 @@ export async function fetchKnowledgeDocuments(page = 1, size = 20) {
   return data
 }
 
+/**
+ * 可选分类：后端内置的那几项，加上库里已经用过的（用户在界面上自建的类型）。
+ *
+ * **不要在前端再写死一份。** 这些值会被原样发给后端、写进切片元数据、
+ * 再当作检索的等值过滤条件用，所以两边必须一字不差；而自建类型前端根本算不出来。
+ * 返回的是字符串数组，顺序即下拉框的显示顺序（内置的在前）。
+ *
+ * 界面上的「其他…」不在这个列表里 —— 那一项是纯 UI 的哨兵值，
+ * 永远不会发给后端（见 KnowledgeView）。
+ */
+export async function fetchKnowledgeCategories() {
+  const { data } = await http.get(`${KNOWLEDGE}/categories`)
+  return data
+}
+
 /** 上传一份文档并建索引。classification 必须命中后端配置里的分类表。 */
 export async function uploadDocument(file, classification) {
   const form = new FormData()
@@ -300,8 +315,10 @@ const BAILIAN = `${KNOWLEDGE}/bailian`
  * 配置自检：配齐了没有、缺哪几项、可选分类有哪些。
  *
  * **不发远程请求**（只读本地配置），所以卡片挂载时可以直接调。
- * `categories` 也从这里拿，不在前端再硬编码一份——那些值必须和
- * `purify.rag.router.categories` 一字不差，多一处就多一处会漂移的地方。
+ * `categories` 也从这里拿，不在前端再硬编码一份——那些值必须和写入端、检索端一字不差，
+ * 多一处就多一处会漂移的地方。它含用户自建的类型（后端从切片元数据里发现的），
+ * 所以要建一个全新的类型时走的是下拉里那一项「其他…」，不是这个列表
+ * （见 `knowledgeCategory.js`）。
  */
 export async function fetchBailianStatus() {
   const { data } = await http.get(`${BAILIAN}/status`)

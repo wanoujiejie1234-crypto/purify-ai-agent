@@ -9,6 +9,7 @@ import com.purify.purifyaiagent.model.KnowledgeBaseStats;
 import com.purify.purifyaiagent.model.KnowledgeDocumentItem;
 import com.purify.purifyaiagent.model.KnowledgeDocumentPage;
 import com.purify.purifyaiagent.model.SyncedSource;
+import com.purify.purifyaiagent.rag.KnowledgeCategories;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.document.DocumentReader;
@@ -100,16 +101,27 @@ public class PgVectorIndexService {
 
     private final RagProperties ragProperties;
 
+    /**
+     * 分类目录。本类<b>只写不读</b>——它在这里的唯一用途是「写完/删完之后让目录失效」。
+     *
+     * <p>为什么非要让写入端碰一下目录：用户自建的分类是<b>第一次上传它时才存在的</b>，
+     * 而检索那边要等目录刷新才会认识它。不主动失效的话，用户传完立刻去问，
+     * 会在缓存过期之前一直问不到刚传的那一类——而那正是最容易被当成 bug 报上来的时刻。
+     */
+    private final KnowledgeCategories knowledgeCategories;
+
     private final TokenTextSplitter splitter;
 
     public PgVectorIndexService(VectorStore vectorStore,
                                 JdbcTemplate pgJdbcTemplate,
                                 PgVectorProperties pgVectorProperties,
-                                RagProperties ragProperties) {
+                                RagProperties ragProperties,
+                                KnowledgeCategories knowledgeCategories) {
         this.vectorStore = vectorStore;
         this.pgJdbcTemplate = pgJdbcTemplate;
         this.pgVectorProperties = pgVectorProperties;
         this.ragProperties = ragProperties;
+        this.knowledgeCategories = knowledgeCategories;
 
         // 表名要拼进 SQL，这里挡一道：配置写错了应当即刻失败，
         // 而不是等到某次查询报语法错误。防线本身在 PgVectorSql 里，
@@ -132,11 +144,11 @@ public class PgVectorIndexService {
      *
      * @param originalFilename 上传时的文件名，同时用作 {@code source} 元数据
      * @param resource         文档内容
-     * @param classification   归档分类，必须与配置的分类表对得上
+     * @param classification   归档分类；内置的和用户自建的都可以，只要格式合法
      */
     public DocumentIndexResult index(String originalFilename, Resource resource, String classification) {
         String source = requireFilename(originalFilename);
-        String category = requireKnownClassification(classification);
+        String category = requireClassification(classification);
 
         // 1. 文档预处理 + 2. 切片（校验都在切片完成之前做，这样校验不通过时旧数据原封不动）
         return write(source, category, split(read(resource, source, category), source));
@@ -166,7 +178,7 @@ public class PgVectorIndexService {
      */
     public DocumentIndexResult indexPreChunked(String source, String classification, List<Document> chunks) {
         String normalizedSource = requireFilename(source);
-        String category = requireKnownClassification(classification);
+        String category = requireClassification(classification);
 
         if (chunks == null || chunks.isEmpty()) {
             throw ApiException.documentIndexFailed("error.kb.chunksEmpty", normalizedSource);
@@ -235,6 +247,10 @@ public class PgVectorIndexService {
                     source, chunks.size(), actual);
         }
 
+        // 目录失效。放在这里而不是各个入口，是因为「往库里写切片」只有这一个地方——
+        // 上传和百炼同步两条路都从这儿过（同 write() 其余部分的理由）
+        knowledgeCategories.refresh();
+
         return new DocumentIndexResult(source, category, chunks.size(), characterCount);
     }
 
@@ -242,6 +258,9 @@ public class PgVectorIndexService {
     public void deleteBySource(String source) {
         String normalized = requireFilename(source);
         vectorStore.delete(new FilterExpressionBuilder().eq(META_SOURCE, normalized).build());
+        // 删掉最后一篇某分类的文档之后，那个分类就不该再出现在下拉框和路由里。
+        // 这不会立刻发生（缓存），但下一次发现就会——而这里主动失效让它紧接着发生
+        knowledgeCategories.refresh();
         log.info("[pgvector索引] {} 的切片已删除", normalized);
     }
 
@@ -257,7 +276,7 @@ public class PgVectorIndexService {
      */
     public ChunkPreview preview(String originalFilename, Resource resource, String classification) {
         String source = requireFilename(originalFilename);
-        String category = requireKnownClassification(classification);
+        String category = requireClassification(classification);
 
         List<Document> chunks = split(read(resource, source, category), source);
 
@@ -546,24 +565,29 @@ public class PgVectorIndexService {
     }
 
     /**
-     * 分类必须是配置里已知的值。
+     * 分类必须是「能安全写进元数据」的值，但<b>不要求它在配置里</b>。
      *
-     * <p>过滤条件是「字段 = 值」的等值匹配，值写错了查不到任何东西、也不报错。
-     * 百炼那边因为打标在控制台里做，只能靠人细心；本地这边能在入口拦住，就别放过。
+     * <p><b>这里原来是一道白名单</b>（必须命中 {@code purify.rag.router.categories}），
+     * 现在改成只校验格式。原因是知识库管理页上多了「其他…」：用户自己填一个类型名，
+     * 那就是一个新分类，它当然不在配置里——继续按白名单拦，这个功能就一步也走不动。
+     *
+     * <p>校验本身不能省，而且理由比原来更硬：这个值会经由
+     * {@code PgVectorFilterExpressionConverter} 被<b>原样拼进 SQL 里的 jsonpath 字符串</b>
+     * （不过滤、不转义，见 {@link PgVectorSql#isSafeMetadataValue}）。
+     * 以前它只可能来自 yml 里那几个固定的值，现在它是用户输入了。
+     *
+     * <p>不再白名单之后，「打错一个字就多出一个分类」这件事没有东西兜底了：
+     * 那类文档照样入库、照样在列表里，只是提问里不出现那个名字就检索不到。
+     * 兜底交给了界面——正常路径是下拉框选，只有明确选「其他…」才需要手打。
      */
-    private String requireKnownClassification(String classification) {
+    private String requireClassification(String classification) {
         if (!StringUtils.hasText(classification)) {
             throw ApiException.unsupportedDocument("error.kb.classificationRequired");
         }
         String category = classification.trim();
-
-        List<String> known = ragProperties.getRouter().getCategories().stream()
-                .map(RagProperties.Category::getValue)
-                .filter(StringUtils::hasText)
-                .toList();
-        // 分类表没配时不拦：配置缺失不该让上传功能整个不可用
-        if (!known.isEmpty() && !known.contains(category)) {
-            throw ApiException.unsupportedDocument("error.kb.classificationUnknown", category, known);
+        if (!PgVectorSql.isSafeMetadataValue(category)) {
+            throw ApiException.unsupportedDocument("error.kb.classificationInvalid",
+                    category, PgVectorSql.MAX_METADATA_VALUE_LENGTH);
         }
         return category;
     }

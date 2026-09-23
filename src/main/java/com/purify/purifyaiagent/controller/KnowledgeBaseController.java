@@ -9,6 +9,7 @@ import com.purify.purifyaiagent.model.ChunkPreview;
 import com.purify.purifyaiagent.model.DocumentIndexResult;
 import com.purify.purifyaiagent.model.KnowledgeBaseStats;
 import com.purify.purifyaiagent.model.KnowledgeDocumentPage;
+import com.purify.purifyaiagent.rag.KnowledgeCategories;
 import com.purify.purifyaiagent.rag.pgvector.PgVectorIndexService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -28,11 +29,12 @@ import java.util.List;
 /**
  * 本地向量库的文档管理接口 —— 流程图里「文档收集」那个入口。
  *
- * <p>三个动作：
+ * <p>动作：
  * <pre>
  *   POST   /api/knowledge/documents   上传一份文档建索引（重复上传同一文件名会覆盖）
  *   DELETE /api/knowledge/documents   按来源删除一份文档的全部切片
  *   GET    /api/knowledge/stats       看当前索引的规模
+ *   GET    /api/knowledge/categories  看能选哪些分类（内置的 + 自建的）
  * </pre>
  *
  * <p><b>只在本地向量库被装配时存在</b>（{@code store=pgvector}）：
@@ -64,9 +66,21 @@ public class KnowledgeBaseController {
 
     private final PgVectorProperties pgVectorProperties;
 
-    public KnowledgeBaseController(PgVectorIndexService indexService, PgVectorProperties pgVectorProperties) {
+    /**
+     * 分类目录。管理页上那个下拉框渲染什么，由这里决定。
+     *
+     * <p><b>它由后端直出，前端不再写死一份</b>：那几个值必须和写入端、检索端一字不差，
+     * 而开放「其他…」之后，下拉框里除了 yml 里那几项还会有用户自建的类型——
+     * 前端不可能自己算出来。多一处硬编码就多一处会漂移的地方。
+     */
+    private final KnowledgeCategories knowledgeCategories;
+
+    public KnowledgeBaseController(PgVectorIndexService indexService,
+                                   PgVectorProperties pgVectorProperties,
+                                   KnowledgeCategories knowledgeCategories) {
         this.indexService = indexService;
         this.pgVectorProperties = pgVectorProperties;
+        this.knowledgeCategories = knowledgeCategories;
     }
 
     /**
@@ -79,9 +93,13 @@ public class KnowledgeBaseController {
      *        -F "file=@减脂食谱.md" -F "classification=食物热量"
      * </pre>
      *
-     * <p>{@code classification} 必须与 {@code purify.rag.router.categories} 里配的分类值
-     * 一字不差——检索时是按这个字段做等值过滤的，值写错了查不到任何东西而且不报错，
-     * 所以在入口就拦下来。
+     * <p>{@code classification} 是归档分类：内置的那几项（{@code purify.rag.router.categories}）
+     * 和用户自建的类型都收。它会被写进切片元数据、并在检索时当等值过滤条件用，
+     * 所以格式有硬限制——只能中英文、数字、空格和 {@code _ - .}，不超过 20 个字符
+     * （理由见 {@code PgVectorSql#isSafeMetadataValue}）。
+     *
+     * <p>自建的类型<b>不需要先登记</b>：传上来它就成了一个分类，路由和下拉框会自己发现它。
+     * 代价见 {@code PgVectorKnowledgeCategories}——提问里要出现这个类型名，检索才会按它过滤。
      */
     @PostMapping(value = "/documents", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public DocumentIndexResult upload(@RequestParam("file") MultipartFile file,
@@ -177,6 +195,24 @@ public class KnowledgeBaseController {
     @GetMapping("/stats")
     public KnowledgeBaseStats stats() {
         return indexService.stats();
+    }
+
+    /**
+     * 可选分类：yml 里内置的那几项，加上库里已经用过的（用户在界面上自建的类型）。
+     *
+     * <p>顺序即下拉框的显示顺序：内置的在前、自建的在后。前端把它和
+     * 「其他…」那一项拼起来渲染，<b>不再自己写死一份</b>——写死的那份和写入端
+     * 必须一字不差，而自建类型它算不出来。
+     *
+     * <p>只回分类值、不回关键词：界面要的只是「能选什么」，
+     * 关键词是路由内部的事（而且自建分类的关键词就是类型名本身，回过去也没有新信息）。
+     *
+     * <p>这是个只读接口，和 {@code /stats} 一样在 {@link RequireAdmin} 覆盖之下：
+     * 它们都不改数据，但都属于知识库模块，一起管起来免得留一个能问出库内容的口子。
+     */
+    @GetMapping("/categories")
+    public List<String> categories() {
+        return knowledgeCategories.values();
     }
 
     /**

@@ -277,6 +277,19 @@ export default {
       title: 'Upload & index',
       desc: 'txt / md only. Re-uploading the same filename replaces its old chunks. Picking a whole folder imports in bulk.',
       category: 'Category',
+      // Placeholder while the list is loading (and if loading it failed)
+      categoryPlaceholder: 'Select…',
+      // The category list comes from the backend (built-in + already used in the store);
+      // only this entry is added by the UI, and picking it reveals the free-text input.
+      // Keep the ellipsis: it is what tells this apart from a real category named “Other”
+      categoryOther: 'Other…',
+      categoryCustomLabel: 'Type name',
+      categoryCustomPlaceholder: 'e.g. Skincare',
+      // {name} is whatever they have typed (or “(empty)”). Same wording rules as the Chinese one
+      categoryCustomHint: 'This becomes its own category, “{name}”. Retrieval matches keywords, so it only filters by this type when the question contains this name. Use letters, digits, spaces and _ - . , up to 20 characters.',
+      categoryCustomEmpty: '(empty)',
+      categoryRequired: 'Type a category name first, then choose the file',
+      categoryLoadFailed: 'Couldn’t load the category list. You can still pick “Other…” and type one.',
       processing: 'Working…',
       pick: 'Choose files',
       pickDir: 'Import a folder',
@@ -375,12 +388,21 @@ export default {
         needPick: 'Bailian didn’t tag this document with a category. Pick one for the whole document:',
         mixed: 'This document’s chunks carry more than one category, so we can’t decide. Pick one for the whole document:',
         category: 'Category',
+        // Same “Other… + type it in” flow as the upload card; see knowledgeCategory.js.
+        // The ellipsis is what keeps this apart from a real category literally named “Other”
+        categoryOther: 'Other…',
+        categoryCustomLabel: 'Type name',
+        categoryCustomPlaceholder: 'e.g. Skincare',
+        categoryCustomHint: 'A new type becomes its own category. Retrieval matches keywords, so it only filters by this type when the question contains this name. Use letters, digits, spaces and _ - . , up to 20 characters.',
         empty: 'This document has no chunks on Bailian yet. Its current status is {status}; try again once it finishes parsing.',
         chars: '{n} chars',
       },
       syncOne: 'Sync just this one',
       noSelection: 'Please select at least one document to sync',
       needCategory: 'These still need a category: {names}. Expand one, pick a category, then sync.',
+      // “Nothing picked” and “picked Other… but left it blank” are reported separately:
+      // for the latter, hunting in the dropdown is useless — they did pick something
+      needCustomName: 'These picked “Other…” but no type name yet: {names}. Expand one, fill the name in, then sync.',
       conflictConfirm: 'A local document named “{name}” already exists and was uploaded here. Syncing replaces it with Bailian’s chunks. Continue?',
       conflictConfirmBatch: 'Some selected documents share a name with an existing local source: {names}. Syncing replaces those with Bailian’s chunks. Continue?',
       timeoutHint: 'Syncing — please don’t close the page. If it times out, reload to see how many made it through; re-syncing is safe.',

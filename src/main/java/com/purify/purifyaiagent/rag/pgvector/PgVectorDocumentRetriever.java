@@ -6,6 +6,7 @@ import com.alibaba.cloud.ai.model.RerankRequest;
 import com.alibaba.cloud.ai.model.RerankResponse;
 import com.purify.purifyaiagent.config.PgVectorProperties;
 import com.purify.purifyaiagent.config.RagProperties;
+import com.purify.purifyaiagent.rag.KnowledgeCategories;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.rag.Query;
@@ -65,6 +66,12 @@ public class PgVectorDocumentRetriever implements DocumentRetriever {
     /** 两条链路共用的参数：重排开关、阈值、条数，以及分类字段名。 */
     private final RagProperties ragProperties;
 
+    /**
+     * 分类目录：判断路由给的分类认不认识。含用户自建的类型（见 {@code KnowledgeCategories}），
+     * 所以「自建类型被当成未知分类而退回全库」这件事不会发生。
+     */
+    private final KnowledgeCategories knowledgeCategories;
+
     private final PgVectorProperties pgVectorProperties;
 
     /**
@@ -90,11 +97,13 @@ public class PgVectorDocumentRetriever implements DocumentRetriever {
 
     public PgVectorDocumentRetriever(VectorStore vectorStore,
                                      RagProperties ragProperties,
+                                     KnowledgeCategories knowledgeCategories,
                                      PgVectorProperties pgVectorProperties,
                                      @Nullable RerankModel rerankModel,
                                      @Nullable PgKeywordSearcher keywordSearcher) {
         this.vectorStore = vectorStore;
         this.ragProperties = ragProperties;
+        this.knowledgeCategories = knowledgeCategories;
         this.pgVectorProperties = pgVectorProperties;
         this.rerankModel = rerankModel;
         this.keywordSearcher = keywordSearcher;
@@ -104,7 +113,7 @@ public class PgVectorDocumentRetriever implements DocumentRetriever {
     public List<Document> retrieve(Query query) {
         // 分类过滤**只判定一次**，两条路共用。各判各的话，漂移的表现是
         // 同一次检索里两条路按不同的分类在查——结果既不报错也说不清是怎么来的
-        ClassificationFilter filter = ClassificationFilter.decide(query, ragProperties);
+        ClassificationFilter filter = ClassificationFilter.decide(query, knowledgeCategories, ragProperties);
 
         long vectorStart = System.currentTimeMillis();
         List<Document> vectorHits = vectorSearch(query, filter);

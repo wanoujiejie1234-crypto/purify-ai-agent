@@ -3,6 +3,7 @@ import { ref, computed, onMounted } from 'vue'
 import {
   fetchKnowledgeStats,
   fetchKnowledgeDocuments,
+  fetchKnowledgeCategories,
   uploadDocument,
   uploadDocuments,
   previewDocument,
@@ -10,6 +11,7 @@ import {
   searchKnowledge,
 } from '../api/http.js'
 import BailianSyncCard from '../components/BailianSyncCard.vue'
+import { MAX_CUSTOM_LENGTH, OTHER, resolveCategory } from '../knowledgeCategory.js'
 import { isEnglish, message, rawMessage, resolveMessage, t } from '../i18n/index.js'
 
 /**
@@ -33,17 +35,50 @@ import { isEnglish, message, rawMessage, resolveMessage, t } from '../i18n/index
 
 /* ------------------------------------------------------------------ 分类 */
 
-// 和后端 purify.rag.router.categories 里的 value 必须一字不差，
-// 后端会拦下不认识的值。这里写死一份是有意的：改成从接口拉，就得先有接口，
-// 而分类表本来就是配置里的静态数据，改它的时候两边一起改更省事。
-//
-// **这三个值不翻译，界面上也是原样显示。** 它们不是「中文文案」，是数据：
-// 写进了 pgvector 的元数据、还被当作等值过滤条件用，翻掉之后已经入库的文档
-// 一份都检索不到——而界面上看不出任何异常，这比报错难查得多。
-// 所以下面 <option> 里没有第二个值可以给，不要在这里做「显示一份、发送一份」。
-const CATEGORIES = ['食物热量', '运动热量', '药物']
+/**
+ * 下拉框里「其他…」那一项（`OTHER`）以及手填类型名的规则，和百炼同步卡片共用
+ * `knowledgeCategory.js` 里那一套 —— 哨兵值和取值规则两边各写一份的话，
+ * 漂移的表现是「有一边把 `__other__` 当类型名发了出去」，而那个后端会当合法分类收下。
+ *
+ * 可选分类由后端直出（`GET /api/knowledge/categories`）：内置的那几项在
+ * `purify.rag.router.categories` 里，用户自建的那些从切片元数据里发现。
+ *
+ * **前端不再写死一份。** 原先这里硬编码着三个值，注释里说明了理由（没有接口可拉）；
+ * 现在有了接口，而理由也反过来了——这些值会被原样发给后端、写进 pgvector 的元数据、
+ * 再当等值过滤条件用，翻掉或写歪任何一个，已入库的文档就一份都检索不到，
+ * 界面上却看不出任何异常。所以它们**不翻译**，也不在这边维护。
+ */
+const categories = ref([])
+const categoryError = ref(null)
+const classification = ref('')
+/** 「其他…」时手填的类型名。它同样不翻译、原样发给后端。 */
+const customClassification = ref('')
 
-const classification = ref(CATEGORIES[0])
+const categoryErrorText = computed(() => resolveMessage(categoryError.value))
+
+/** 这次上传/预览实际要用的分类：选了「其他…」用输入框里的，否则用选中那一项。 */
+const effectiveClassification = computed(() =>
+  resolveCategory(classification.value, customClassification.value),
+)
+
+/** 没选/没填分类时按钮不可点 —— 空分类后端一定拒，在这里先说清楚，省一次往返。 */
+const hasClassification = computed(() => !!effectiveClassification.value)
+
+async function loadCategories() {
+  try {
+    const list = await fetchKnowledgeCategories()
+    categories.value = Array.isArray(list) ? list : []
+    categoryError.value = null
+    // 默认选中第一项（内置的第一类）。只在还没选过的时候设，
+    // 否则每次刷新都会把用户选的「其他…」冲掉。
+    // 列表为空时不假装选中了什么：那时只剩「其他…」，让用户自己填
+    if (!classification.value && categories.value.length) {
+      classification.value = categories.value[0]
+    }
+  } catch (err) {
+    categoryError.value = err.message ? rawMessage(err.message) : message('knowledge.upload.categoryLoadFailed')
+  }
+}
 
 /* ------------------------------------------------------------------ 概览 */
 
@@ -101,7 +136,9 @@ function goto(next) {
 }
 
 async function refreshAll() {
-  await Promise.all([loadStats(), loadDocuments()])
+  // 分类列表也一起刷：刚传上去的自建类型就是这时候第一次出现在库里，
+  // 不刷的话用户得手动刷新页面才看得到自己刚建的那一类
+  await Promise.all([loadStats(), loadDocuments(), loadCategories()])
 }
 
 async function remove(source) {
@@ -148,18 +185,27 @@ async function onFiles(event) {
   // input 用完就重置，否则连续选同一个文件不会再触发 change
   event.target.value = ''
 
+  // 分类先算出来、也先判一次。后端对空分类是直接 400（error.kb.classificationRequired），
+  // 但那时文件已经读进内存了；在这里拦下来更快，也说得出「你还没填类型名」
+  const category = effectiveClassification.value
+  if (!category) {
+    uploadMessage.value = null
+    uploadError.value = [message('knowledge.upload.categoryRequired')]
+    return
+  }
+
   uploading.value = true
   uploadMessage.value = null
   uploadError.value = []
   try {
     if (files.length === 1) {
-      const result = await uploadDocument(files[0], classification.value)
+      const result = await uploadDocument(files[0], category)
       uploadMessage.value = message('knowledge.upload.single', {
         source: result.source,
         count: result.chunkCount,
       })
     } else {
-      const result = await uploadDocuments(files, classification.value)
+      const result = await uploadDocuments(files, category)
       uploadMessage.value = message('knowledge.upload.batch', {
         ok: result.succeeded,
         failed: result.failed,
@@ -175,7 +221,13 @@ async function onFiles(event) {
       )
     }
     page.value = 1
+    // 自建类型是这一刻才第一次进库的，所以刷新要能把它带进下拉框
     await refreshAll()
+    // 刚手填的那个类型现在是一个正式选项了，把下拉切过去。
+    // 不切的话界面会一直停在「其他…」上，用户会以为它没生效
+    if (classification.value === OTHER && categories.value.includes(category)) {
+      classification.value = category
+    }
   } catch (err) {
     // 整批失败（网络、超时）：只有一句话
     uploadError.value = [err.message ? rawMessage(err.message) : message('knowledge.upload.failed')]
@@ -197,11 +249,20 @@ async function onPreviewFile(event) {
   event.target.value = ''
   if (!file) return
 
+  // 预览也要分类：它走的是和真上传完全相同的切片与校验（见 PgVectorIndexService#preview），
+  // 所以这里放行的话，正式上传也不会在这里被拦
+  const category = effectiveClassification.value
+  if (!category) {
+    preview.value = null
+    previewError.value = message('knowledge.upload.categoryRequired')
+    return
+  }
+
   previewing.value = true
   preview.value = null
   previewError.value = null
   try {
-    preview.value = await previewDocument(file, classification.value)
+    preview.value = await previewDocument(file, category)
   } catch (err) {
     previewError.value = err.message ? rawMessage(err.message) : message('knowledge.preview.failed')
   } finally {
@@ -299,39 +360,81 @@ onMounted(refreshAll)
         <div class="row">
           <label class="field">
             {{ $t('knowledge.upload.category') }}
-            <!-- 这一列**不翻译**：它的值要和后端 purify.rag.router.categories 一字不差，
-                 翻了已入库的文档全都检索不到。理由写在上面 CATEGORIES 那里 -->
+            <!-- 这一列**不翻译**：它的值要和后端一字不差（写进元数据、当等值过滤条件用），
+                 翻了已入库的文档全都检索不到。列表由后端直出，理由写在上面 categories 那里。
+                 最后那一项是纯界面的哨兵值，选中它才出现下面的输入框 -->
             <select v-model="classification">
-              <option v-for="c in CATEGORIES" :key="c" :value="c">{{ c }}</option>
+              <!-- 列表还没拉回来（或者拉失败）时占着首位。
+                   没有它的话，模型里是空串而浏览器会把第一个选项显示成选中，
+                   按钮是灰的、下拉框却看着像选好了，用户会以为界面坏了 -->
+              <option value="" disabled>{{ $t('knowledge.upload.categoryPlaceholder') }}</option>
+              <option v-for="c in categories" :key="c" :value="c">{{ c }}</option>
+              <option :value="OTHER">{{ $t('knowledge.upload.categoryOther') }}</option>
             </select>
           </label>
 
-          <label class="btn" :class="{ disabled: uploading }">
+          <!-- 「其他…」才出现。类型名是自由文本，所以长度和字符都有限制
+               （中英文、数字、空格、_ - .，最多 20 个）——后端会再校验一遍，
+               限制的原因是它会被拼进一条 SQL 里的过滤条件，见 PgVectorSql -->
+          <label v-if="classification === OTHER" class="field">
+            {{ $t('knowledge.upload.categoryCustomLabel') }}
+            <input
+              v-model="customClassification"
+              type="text"
+              :maxlength="MAX_CUSTOM_LENGTH"
+              :placeholder="$t('knowledge.upload.categoryCustomPlaceholder')"
+            />
+          </label>
+
+          <label class="btn" :class="{ disabled: uploading || !hasClassification }">
             {{ uploading ? $t('knowledge.upload.processing') : $t('knowledge.upload.pick') }}
-            <input type="file" accept=".txt,.md,.markdown" multiple :disabled="uploading" @change="onFiles" />
+            <input
+              type="file"
+              accept=".txt,.md,.markdown"
+              multiple
+              :disabled="uploading || !hasClassification"
+              @change="onFiles"
+            />
           </label>
 
           <!-- 选目录要单独一个 input：webkitdirectory 一旦加上，这个框就只能选目录、
                不能再多选散文件，两者是互斥的两种选择方式，硬塞进一个框会顾此失彼。
                非 Chrome/Edge 浏览器会忽略这个属性，退化成普通多选，不影响可用性 -->
-          <label class="btn subtle" :class="{ disabled: uploading }">
+          <label class="btn subtle" :class="{ disabled: uploading || !hasClassification }">
             {{ uploading ? $t('knowledge.upload.processing') : $t('knowledge.upload.pickDir') }}
             <input
               type="file"
               accept=".txt,.md,.markdown"
               webkitdirectory
               multiple
-              :disabled="uploading"
+              :disabled="uploading || !hasClassification"
               @change="onFiles"
             />
           </label>
 
-          <label class="btn subtle" :class="{ disabled: previewing }">
+          <label class="btn subtle" :class="{ disabled: previewing || !hasClassification }">
             {{ previewing ? $t('knowledge.upload.previewing') : $t('knowledge.upload.preview') }}
-            <input type="file" accept=".txt,.md,.markdown" :disabled="previewing" @change="onPreviewFile" />
+            <input
+              type="file"
+              accept=".txt,.md,.markdown"
+              :disabled="previewing || !hasClassification"
+              @change="onPreviewFile"
+            />
           </label>
         </div>
 
+        <!-- 自建类型的两条代价说在前面，而不是等用户传完了发现「检索不到」再来查：
+             一、它会成为一个独立分类；二、路由是纯字符串匹配，提问里得出现这个名字。
+             名字写进句子里的那个占位符，所以用户改一个字这句话就跟着变 -->
+        <p v-if="classification === OTHER" class="hint">
+          {{
+            $t('knowledge.upload.categoryCustomHint', {
+              name: customClassification.trim() || $t('knowledge.upload.categoryCustomEmpty'),
+            })
+          }}
+        </p>
+
+        <p v-if="categoryErrorText" class="err">{{ categoryErrorText }}</p>
         <p v-if="uploadMessageText" class="ok">{{ uploadMessageText }}</p>
         <p v-if="uploadErrorText" class="err">{{ uploadErrorText }}</p>
         <p v-if="previewErrorText" class="err">{{ previewErrorText }}</p>
@@ -618,6 +721,30 @@ onMounted(refreshAll)
   font: inherit;
   font-size: 13px;
   color: var(--ink);
+}
+/* 自建类型的输入框。宽度写死一点：它和 select 并排，跟着内容伸缩会让整行跳来跳去 */
+.field input[type='text'] {
+  width: 150px;
+  padding: 6px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink);
+  outline: none;
+}
+.field input[type='text']:focus {
+  border-color: #10a37f;
+  box-shadow: 0 0 0 3px #10a37f1f;
+}
+
+/* 「其他…」那一行说明。不是报错，所以不用红色 —— 它讲的是这个类型会被怎么用 */
+.hint {
+  margin-top: 10px;
+  color: #6b7381;
+  font-size: 12.5px;
+  line-height: 1.7;
 }
 
 /* 文件选择：原生 input 长得没法看，把 label 做成按钮、把 input 藏起来 */

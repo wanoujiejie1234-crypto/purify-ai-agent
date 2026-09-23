@@ -55,6 +55,49 @@ public final class PgVectorSql {
         return assertSafeIdentifier(metadataKey, propertyName);
     }
 
+    /** 元数据取值的长度上限，和 {@link #SAFE_METADATA_VALUE} 里的数字是同一个。 */
+    public static final int MAX_METADATA_VALUE_LENGTH = 20;
+
+    /**
+     * 元数据<b>取值</b>的合法字符集：中英文（{@code \p{L}} 覆盖汉字）、数字、
+     * 空格、下划线、连字符、点。长度上限见 {@link #MAX_METADATA_VALUE_LENGTH}。
+     *
+     * <p><b>为什么取值也要限制字符，而不是「参数化就够了」</b>：分类值确实有一半走的是
+     * 参数（关键词那一路，见 {@code ClassificationFilter#toSqlArgument}），
+     * 但另一半<b>不走</b>——向量那一路把值交给 Spring AI 的
+     * {@code PgVectorFilterExpressionConverter}，它是这么拼的：
+     * <pre>
+     *   context.append(String.format("\"%s\"", value));      // 不过滤、不转义
+     *   ... "WHERE metadata::jsonb @@ '" + native + "'::jsonpath"
+     * </pre>
+     * 也就是说值被原样塞进一个 SQL 单引号字符串里的 jsonpath 双引号字符串里。
+     * 一个 {@code '} 能从 SQL 字面量里逃出来，一个 {@code "} 或 {@code \} 能从 jsonpath
+     * 的字符串里逃出来。**这是本项目里唯一一处「用户输入进 SQL 字符串」的地方**，
+     * 所以入口必须收窄成上面这个白名单——分类值曾经只可能来自 yml 里的固定几项，
+     * 开放「自定义类型」之后它就真的成了用户输入。
+     *
+     * <p>提示文案（{@code error.kb.classificationInvalid}）里逐字描述了这条规则。
+     * <b>改这个正则时要连那份文案一起改</b>，中英各一条。
+     */
+    private static final String SAFE_METADATA_VALUE =
+            "^[\\p{L}\\p{N} _\\-.]{1," + MAX_METADATA_VALUE_LENGTH + "}$";
+
+    /**
+     * 这个值能不能安全地写进 pgvector 的元数据、并（对分类而言）当作等值过滤条件用。
+     *
+     * <p>写入端（{@code PgVectorIndexService}）和读取端（{@code PgVectorKnowledgeCategories}
+     * 从库里发现分类时）都要过这一关，所以规则放在这里一份，两边引用同一个判断——
+     * 各写一份的话，漂移的表现是「写入端放行了读取端又过滤掉」，
+     * 用户看到的是「刚传的分类过一会儿自己消失了」。
+     *
+     * <p>顺带把「全是空白」也判成不安全：字符集那一关拦不住它（空格本身合法），
+     * 而一个纯空白的分类值当成过滤条件用，等于查一个永远查不到的东西。
+     * 写入端本来就会先 trim 再要求非空，这里收紧只是不让这个判断单独用时留个洞。
+     */
+    public static boolean isSafeMetadataValue(String value) {
+        return value != null && !value.isBlank() && value.matches(SAFE_METADATA_VALUE);
+    }
+
     /** {@code schema.table}，两段都过一遍标识符校验。 */
     public static String qualifiedTableName(PgVectorProperties properties) {
         return assertSafeIdentifier(properties.getSchemaName(), "purify.rag.pgvector.schema-name")

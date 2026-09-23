@@ -2,6 +2,7 @@ package com.purify.purifyaiagent.config;
 
 import com.alibaba.cloud.ai.dashscope.api.DashScopeApi;
 import com.purify.purifyaiagent.i18n.MessageResolver;
+import com.purify.purifyaiagent.rag.KnowledgeCategories;
 import com.purify.purifyaiagent.rag.bailian.BailianConsoleClient;
 import com.purify.purifyaiagent.rag.bailian.BailianKbSyncService;
 import com.purify.purifyaiagent.rag.pgvector.PgVectorIndexService;
@@ -71,10 +72,11 @@ public class BailianSyncConfig {
                                                      BailianKbProperties bailianKbProperties,
                                                      PgVectorIndexService pgVectorIndexService,
                                                      RagProperties ragProperties,
+                                                     KnowledgeCategories knowledgeCategories,
                                                      PgVectorProperties pgVectorProperties,
                                                      MessageResolver messageResolver,
                                                      DashScopeApi ragDashScopeApi) {
         return new BailianKbSyncService(bailianConsoleClient, bailianKbProperties, pgVectorIndexService,
-                ragProperties, pgVectorProperties, messageResolver, ragDashScopeApi);
+                ragProperties, knowledgeCategories, pgVectorProperties, messageResolver, ragDashScopeApi);
     }
 }

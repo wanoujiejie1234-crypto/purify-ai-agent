@@ -53,7 +53,7 @@ public class ApiException extends RuntimeException {
     /** 对话请求本身不合法，比如 {@code message} 为空。 */
     public static final String INVALID_CHAT_REQUEST = "INVALID_CHAT_REQUEST";
 
-    /** 这份文档知识库不收：格式不支持、体积超限、没带文件名、分类值不在配置表里。 */
+    /** 这份文档知识库不收：格式不支持、体积超限、没带文件名、分类名不合法。 */
     public static final String UNSUPPORTED_DOCUMENT = "UNSUPPORTED_DOCUMENT";
 
     /** 文档收下了，但建索引这一步做不下去：内容为空、编码不是 UTF-8、切片数撞上限。 */

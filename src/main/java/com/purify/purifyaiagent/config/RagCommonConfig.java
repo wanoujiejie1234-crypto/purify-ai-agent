@@ -1,6 +1,7 @@
 package com.purify.purifyaiagent.config;
 
 import com.alibaba.cloud.ai.dashscope.api.DashScopeApi;
+import com.purify.purifyaiagent.rag.KnowledgeCategories;
 import com.purify.purifyaiagent.rag.KnowledgeRouter;
 import com.purify.purifyaiagent.rag.KnowledgeSearch;
 import com.purify.purifyaiagent.rag.pgvector.KeywordArmStatus;
@@ -13,6 +14,7 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.reactive.function.client.WebClient;
 
+import java.util.List;
 import java.util.Locale;
 
 /**
@@ -55,10 +57,17 @@ public class RagCommonConfig {
                 .build();
     }
 
-    /** 关键词路由：判定「要不要查、查哪一类」，纯字符串匹配，不产生任何远程开销。 */
+    /**
+     * 关键词路由：判定「要不要查、查哪一类」，纯字符串匹配，不产生任何远程开销。
+     *
+     * <p>分类来自 {@link KnowledgeCategories} 而不是直接读 {@code ragProperties}：
+     * 除了 yml 里那几个内置分类，还有用户在管理页上自建的类型（本地向量库链路会
+     * 从库里把它们发现出来）。详见那个接口的类注释。
+     */
     @Bean
-    public KnowledgeRouter knowledgeRouter(RagProperties ragProperties) {
-        return new KnowledgeRouter(ragProperties);
+    public KnowledgeRouter knowledgeRouter(RagProperties ragProperties,
+                                           KnowledgeCategories knowledgeCategories) {
+        return new KnowledgeRouter(ragProperties, knowledgeCategories);
     }
 
     /**
@@ -82,17 +91,24 @@ public class RagCommonConfig {
     @Bean
     public KnowledgeSearch knowledgeSearch(DocumentRetriever knowledgeBaseDocumentRetriever,
                                            KnowledgeRouter knowledgeRouter,
+                                           KnowledgeCategories knowledgeCategories,
                                            RagProperties ragProperties,
                                            ObjectProvider<KeywordArmStatus> keywordArmStatus) {
         // 启动体检：把「检索到底按什么参数在跑」一次打全。
         // 原先这些值散在三个配置类里，而最该被看见的两个（rerank-top-n、rerank-min-score）
         // 从来没有被打过——「知识库没召回东西」的排查全靠这两个数，
-        // 不念出来就得去翻 yml，而翻的时候还未必知道该翻哪一项
-        log.info("[RAG] 检索已装配：store={}，路由={}（{} 个分类，未命中时{}），"
+        // 不念出来就得去翻 yml，而翻的时候还未必知道该翻哪一项。
+        //
+        // 分类数在这里读的是**目录**（内置 + 库里发现的），不是 yml 那一份：
+        // 两者在有人传过自建类型之后就不一样了，而「路由认识几个分类」
+        // 恰恰是排查「自建类型检索不到」的第一个数
+        List<String> categories = knowledgeCategories.values();
+        log.info("[RAG] 检索已装配：store={}，路由={}（{} 个分类：{}，未命中时{}），"
                         + "重排={}，阈值={}，最终条数={}，关键词路={}",
                 ragProperties.getStore().name().toLowerCase(Locale.ROOT),
                 ragProperties.getRouter().isEnabled() ? "开" : "关",
-                ragProperties.getRouter().getCategories().size(),
+                categories.size(),
+                categories,
                 ragProperties.getRouter().isQueryAllWhenUnmatched() ? "查全库" : "跳过",
                 ragProperties.isEnableReranking() ? ragProperties.getRerankModelName() : "关",
                 ragProperties.getRerankMinScore(),

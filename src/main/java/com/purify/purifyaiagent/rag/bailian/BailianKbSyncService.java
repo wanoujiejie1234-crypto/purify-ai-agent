@@ -17,6 +17,7 @@ import com.purify.purifyaiagent.model.BailianSyncStatus;
 import com.purify.purifyaiagent.model.BatchIndexResult;
 import com.purify.purifyaiagent.model.DocumentIndexResult;
 import com.purify.purifyaiagent.model.SyncedSource;
+import com.purify.purifyaiagent.rag.KnowledgeCategories;
 import com.purify.purifyaiagent.rag.pgvector.PgVectorIndexService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.document.Document;
@@ -112,6 +113,14 @@ public class BailianKbSyncService {
 
     private final RagProperties ragProperties;
 
+    /**
+     * 分类目录。同步卡片上「这份文档归哪一类」的候选值来自这里，
+     * 而不是直接读 {@code ragProperties.router.categories}——后者只有内置那几项，
+     * 用户在管理页上自建的类型不在里面。少列一个的表现是「明明有这个分类，
+     * 下拉框里却没有」，逼用户去百炼控制台补标。
+     */
+    private final KnowledgeCategories knowledgeCategories;
+
     private final PgVectorProperties pgVectorProperties;
 
     private final MessageResolver messageResolver;
@@ -122,6 +131,7 @@ public class BailianKbSyncService {
                                 BailianKbProperties properties,
                                 PgVectorIndexService indexService,
                                 RagProperties ragProperties,
+                                KnowledgeCategories knowledgeCategories,
                                 PgVectorProperties pgVectorProperties,
                                 MessageResolver messageResolver,
                                 DashScopeApi dashScopeApi) {
@@ -129,6 +139,7 @@ public class BailianKbSyncService {
         this.properties = properties;
         this.indexService = indexService;
         this.ragProperties = ragProperties;
+        this.knowledgeCategories = knowledgeCategories;
         this.pgVectorProperties = pgVectorProperties;
         this.messageResolver = messageResolver;
         this.dashScopeApi = dashScopeApi;
@@ -182,12 +193,9 @@ public class BailianKbSyncService {
                 : ragProperties.getWorkspaceId();
     }
 
-    /** 可选分类值。直出给前端，省得它再硬编码一份——硬编码多一处就多一处会漂移的地方。 */
+    /** 可选分类值。来自分类目录（内置 + 库中发现的），省得前端再硬编码一份。 */
     private List<String> categories() {
-        return ragProperties.getRouter().getCategories().stream()
-                .map(RagProperties.Category::getValue)
-                .filter(StringUtils::hasText)
-                .toList();
+        return knowledgeCategories.values();
     }
 
     // ==================== 文件清单 ====================
@@ -439,15 +447,21 @@ public class BailianKbSyncService {
      * 定下这份文档用哪个分类。
      *
      * <p>规则只有一条，好解释也好看：<b>百炼切片的元数据里恰好只有一个认识的分类时用它，
-     * 其余情况（一个都没有、标了多个、标的值不在配置表里）都用请求里带的那个。</b>
+     * 其余情况（一个都没有、标了多个、标的值不在分类目录里）都用请求里带的那个。</b>
      * 前者是「百炼已经标清楚了」，后者是「百炼没说清，让人来定」。
+     *
+     * <p>「认识的分类」来自 {@code KnowledgeCategories}，<b>不只是 yml 里内置的那几项</b>：
+     * 用户自建的类型也在里面。这样在百炼控制台上按自建类型打标过的文档，
+     * 同步过来会原样保留那个分类，而不是掉回人要重选一次。
+     *
+     * <p><b>请求里带的那个值可以是自建的新类型</b>——界面上的「其他…」走的就是这条路。
+     * 它不在这里校验：下游的 {@code PgVectorIndexService#requireClassification} 会校验
+     * （字符集与长度），这里只负责「有没有」。一份文档在这里被定成一个全新的分类名，
+     * 然后由那次校验放行、入库、并被分类目录发现出来。
      *
      * <p>为什么标了多个时不挑一个：分类做的是等值过滤，挑错的后果是这些切片
      * 在带分类过滤的提问下永远检索不到，<b>而且不报任何错</b>。既然要塌缩成一个
      * （一份文档两行会让「这个问题该查哪一类」的语义变模糊），那就必须由人来选。
-     *
-     * <p>反过来，请求里带的那个值会被 {@code requireKnownClassification} 再校验一遍，
-     * 所以这里不做重复校验，只负责「有没有」。
      */
     private String resolveClassification(List<BailianConsoleClient.ConsoleChunk> chunks,
                                          String fallback,
